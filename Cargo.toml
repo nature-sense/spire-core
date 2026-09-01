@@ -1,0 +1,70 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2026 NatureSense
+
+[package]
+name = "spire-core"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Spire core process — Rust actor system with MCP client, runs as VS Code extension subprocess"
+
+[lib]
+crate-type = ["lib"]
+
+[features]
+# When enabled, the graph GQL tests panic on any GQL failure instead of
+# tolerating in-memory-schema limitations.
+strict-gql = []
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rust-mcp-sdk = "1.0"
+rust-mcp-transport = "0.9"
+rust-mcp-schema = "0.10"
+anyhow = "1"
+thiserror = "2"
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+futures = "0.3"
+chrono = { version = "0.4", features = ["serde"] }
+tracing-appender = "0.2"
+dirs = "5"
+spire-actor = { path = "../spire-actor" }
+selene-db-core = { version = "1.4.0", package = "selene-db-core" }
+selene-db-graph = { version = "1.4.0", package = "selene-db-graph" }
+selene-db-gql = { version = "1.4.0", package = "selene-db-gql" }
+selene-db-persist = { version = "1.4.0", package = "selene-db-persist" }
+candle-core = "0.11.0"
+candle-nn = "0.11.0"
+candle-transformers = "0.11.0"
+hf-hub = { version = "1.0.0-rc.1", features = ["blocking"] }
+tokenizers = "0.21"
+md-5 = "0.10"
+time = "=0.3.36"
+walkdir = "2"
+ignore = "0.4"
+notify = "6"
+sha2 = "0.10"
+cargo_metadata = "0.19"
+tree-sitter = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-javascript = "0.23"
+tree-sitter-python = "0.23"
+glob-match = "0.2"
+regex = "1"
+serde_yaml = "0.9"
+scraper = "0.19"
+lopdf = "0.34"
+num_cpus = "1"
+
+[dev-dependencies]
+tracing-test = "0.2"
+tempfile = "3"
+
+[profile.dev]
+debug = "line-tables-only"
