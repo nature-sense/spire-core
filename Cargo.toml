@@ -21,8 +21,8 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rust-mcp-sdk = "1.0"
-rust-mcp-transport = "0.9"
-rust-mcp-schema = "0.10"
+rust-mcp-transport = "1.0"
+rust-mcp-schema = "1.0"
 anyhow = "1"
 thiserror = "2"
 async-trait = "0.1"
@@ -39,9 +39,9 @@ selene-db-core = { version = "1.4.0", package = "selene-db-core" }
 selene-db-graph = { version = "1.4.0", package = "selene-db-graph" }
 selene-db-gql = { version = "1.4.0", package = "selene-db-gql" }
 selene-db-persist = { version = "1.4.0", package = "selene-db-persist" }
-candle-core = "0.11.0"
-candle-nn = "0.11.0"
-candle-transformers = "0.11.0"
+candle-core = { version = "0.11.0", features = ["metal", "accelerate"] }
+candle-nn = { version = "0.11.0", features = ["metal", "accelerate"] }
+candle-transformers = { version = "0.11.0", features = ["metal", "accelerate"] }
 hf-hub = { version = "1.0.0-rc.1", features = ["blocking"] }
 tokenizers = "0.21"
 md-5 = "0.10"
