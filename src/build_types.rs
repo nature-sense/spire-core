@@ -190,7 +190,37 @@ pub enum ProjectStructure {
     /// Meson: shared core + `hal/api/*.hpp` contract + per-platform
     /// implementations + per-target build (the ai-traps shape).
     Hal,
+    /// Rust/SwiftUI monorepo built on the Spire framework: a Cargo workspace
+    /// (`crates/spire-<name>` crate) plus a host SwiftUI app (`ui/swift`),
+    /// with `spire-actor` + `spire-core` as sibling path dependencies. Host
+    /// (macOS) only.
+    SpireApp,
 }
+
+impl ProjectStructure {
+    /// Stable snake_case key ("native" | "single_source" | "hal" | "spire_app"),
+    /// matching `#[serde(rename_all = "snake_case")]`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ProjectStructure::Native => "native",
+            ProjectStructure::SingleSource => "single_source",
+            ProjectStructure::Hal => "hal",
+            ProjectStructure::SpireApp => "spire_app",
+        }
+    }
+
+    /// Parse a wizard/FFI structure key; unknown or empty falls back to the
+    /// default (Native), matching how unknown config previously behaved.
+    pub fn from_str(s: &str) -> ProjectStructure {
+        match s {
+            "single_source" => ProjectStructure::SingleSource,
+            "hal" => ProjectStructure::Hal,
+            "spire_app" => ProjectStructure::SpireApp,
+            _ => ProjectStructure::Native,
+        }
+    }
+}
+
 
 /// Diagnostic found while importing/analyzing a project. Non-fatal — analysis
 /// still succeeds, but surfaced to the user so structure problems (e.g. a HAL
@@ -499,4 +529,19 @@ pub fn all_config_file_names() -> Vec<&'static str> {
         "Rakefile",
         "*.gemspec",
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_structure_keys_roundtrip() {
+        for key in ["native", "single_source", "hal", "spire_app"] {
+            assert_eq!(ProjectStructure::from_str(key).as_str(), key);
+        }
+        assert_eq!(ProjectStructure::from_str(""), ProjectStructure::Native);
+        assert_eq!(ProjectStructure::from_str("bogus"), ProjectStructure::Native);
+        assert_eq!(ProjectStructure::from_str("SPIRE_APP"), ProjectStructure::Native);
+    }
 }
