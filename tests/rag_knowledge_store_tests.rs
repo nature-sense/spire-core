@@ -8,7 +8,7 @@
 //! 1. Ingesting a canonical `ingest.yaml` stores chunks + entities +
 //!    relationships (content-addressed names) in the KnowledgeStore data
 //!    plane (`SPIRE_KNOWLEDGE_DIR`), NOT the project store.
-//! 2. The project graph keeps only a `rag_provenance` node (platform_id +
+//! 2. The project graph keeps only a `rag_provenance` node (domain +
 //!    corpus_version) — never the corpus itself.
 //! 3. A FRESH project with an EMPTY project store can query the same domain
 //!    and resolve chunks from the shared KnowledgeStore (no re-ingest).
@@ -29,9 +29,9 @@ use spire_core::models::embedding::Embedder;
 
 use tokio::sync::{mpsc, oneshot};
 
-/// Serializes tests that mutate the process-wide `SPIRE_KNOWLEDGE_DIR` /
-/// `SPIRE_PLATFORM_DIR` env vars — Cargo runs tests in the same process in
-/// parallel, so without a gate the two RAG tests clobber each other's dirs.
+/// Serializes tests that mutate the process-wide `SPIRE_KNOWLEDGE_DIR` env var
+/// — Cargo runs tests in the same process in parallel, so without a gate the
+/// two RAG tests clobber each other's dirs.
 static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Load the real embedding model from the HF cache. Returns `None` (printing a
@@ -133,40 +133,9 @@ async fn query_rag(
     r.await.expect("query reply").expect("query ok")
 }
 
-/// Fixture: a real `~/.spire/platforms/a7s.yaml` (via SPIRE_PLATFORM_DIR) so
-/// `resolve_domain` resolves "Radxa Cubie A7S" → "a7s".
-fn write_platform_seed(tmp: &std::path::Path) {
-    let dir = tmp.join("platforms");
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(
-        dir.join("a7s.yaml"),
-        r#"id: a7s
-name: Cubie A7S
-os: linux
-architecture:
-  cpu_family: aarch64
-  cpu: armv8-a
-  endian: little
-  target_triple: aarch64-linux-gnu
-  march: armv8.2-a+crc
-toolchain:
-  c: clang
-  cpp: clang++
-  ar: llvm-ar
-  strip: llvm-strip
-sysroot:
-  root: /opt/a7s-sysroot
-  lib_dirs:
-    - ${SYSROOT}/usr/lib/aarch64-linux-gnu
-  pkg_config_libdir:
-    - ${SYSROOT}/usr/lib/aarch64-linux-gnu/pkgconfig
-"#,
-    )
-    .unwrap();
-}
-
 /// Write a canonical `ingest.yaml` with a local docs source + domains +
-/// relationship inference. Returns (manifest_path, docs_dir).
+/// relationship inference. The corpus id ("a7s") comes from the manifest's
+/// own directory (`<knowledge>/a7s/ingest.yaml`) — no platform lookup.
 fn write_ingest_config(tmp: &std::path::Path) -> (PathBuf, PathBuf) {
     let dir = tmp.join("knowledge").join("a7s");
     std::fs::create_dir_all(&dir).unwrap();
@@ -238,9 +207,7 @@ async fn knowledge_store_split_ingest_and_share() {
         return;
     };
     let tmp = tempfile::tempdir().unwrap();
-    std::env::set_var("SPIRE_PLATFORM_DIR", tmp.path().join("platforms"));
     std::env::set_var("SPIRE_KNOWLEDGE_DIR", tmp.path().join("knowledge"));
-    write_platform_seed(tmp.path());
 
     // ── 1. Project A: ingest the config → chunks/entities land in KnowledgeStore ──
     let project_a = tmp.path().join("proj-a");
@@ -269,7 +236,6 @@ async fn knowledge_store_split_ingest_and_share() {
         );
         assert!(report.chunks > 0, "must ingest at least one chunk");
         assert_eq!(report.domain, "a7s");
-        assert_eq!(report.platform_id, "a7s");
         assert!(report.entities > 0, "must extract at least one entity");
         assert!(report.relationships > 0, "must infer at least one relationship");
     }
@@ -355,7 +321,7 @@ async fn knowledge_store_split_ingest_and_share() {
             .unwrap();
         let manifests = r.await.unwrap().expect("list manifests");
         assert!(
-            manifests.iter().any(|m| m.platform_id == "a7s" && m.path.ends_with("ingest.yaml")),
+            manifests.iter().any(|m| m.domain == "a7s" && m.path.ends_with("ingest.yaml")),
             "the a7s ingest.yaml must be discovered: {:?}",
             manifests
         );
@@ -372,9 +338,7 @@ async fn ingest_without_project() {
         return;
     };
     let tmp = tempfile::tempdir().unwrap();
-    std::env::set_var("SPIRE_PLATFORM_DIR", tmp.path().join("platforms"));
     std::env::set_var("SPIRE_KNOWLEDGE_DIR", tmp.path().join("knowledge"));
-    write_platform_seed(tmp.path());
 
     // KnowledgeStore only; NO project graph in scope.
     let knowledge_tx = spawn_graph(&tmp.path().join("knowledge"), &embedder).await;

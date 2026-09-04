@@ -53,6 +53,13 @@ pub struct GraphRagConfig {
 pub struct PipelineConfig {
     #[serde(default)]
     pub name: String,
+    /// Canonical corpus/domain id this ingest script writes into. Optional —
+    /// when absent the manifest's own directory name
+    /// (`knowledge/<corpus>/ingest.yaml`) is used, then `name`.
+    #[serde(default)]
+    pub corpus: String,
+    /// Legacy, tolerated only for older manifests; no longer consulted for
+    /// domain resolution when `corpus` or the manifest directory is present.
     #[serde(default, rename = "target_platform")]
     pub target_platform: String,
     #[serde(default)]
@@ -236,7 +243,6 @@ pub struct SourceStatus {
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct IngestReport {
     pub domain: String,
-    pub platform_id: String,
     pub corpus_version: String,
     pub chunks: u32,
     pub entities: u32,
@@ -262,21 +268,11 @@ fn sha256_hex(data: &[u8]) -> String {
     format!("{:x}", h.finalize())
 }
 
-/// Resolve `pipeline.target_platform` to a RAG domain slug.
-pub fn resolve_domain(target_platform: &str) -> String {
-    let t = target_platform.trim();
+/// Slugify a corpus name into the RAG domain key used for retrieval.
+fn slugify_corpus(name: &str) -> String {
+    let t = name.trim();
     if t.is_empty() {
         return "default".to_string();
-    }
-    let lower = t.to_lowercase();
-    if let Ok(platforms) =
-        crate::build_types::Platform::load_directory(&crate::build_types::Platform::default_platform_dir())
-    {
-        for p in platforms {
-            if p.id == t || lower.contains(&p.id.to_lowercase()) {
-                return p.id;
-            }
-        }
     }
     let first = t.split('/').next().unwrap_or(t);
     let slug: String = first
@@ -299,6 +295,25 @@ pub fn resolve_domain(target_platform: &str) -> String {
     } else {
         slug
     }
+}
+
+/// Resolve the corpus/domain an ingest script targets — independent of any
+/// build platform. Resolution order:
+///   1. the script's explicit `pipeline.corpus` id (slugified);
+///   2. the manifest's own directory name (`knowledge/<corpus>/ingest.yaml`),
+///      which keeps conventionally-named corpora stable without extra fields;
+///   3. `pipeline.name` (slugified), then the legacy `target_platform` slug.
+pub fn corpus_domain(config: &GraphRagConfig, manifest_dir: &str) -> String {
+    if !config.pipeline.corpus.trim().is_empty() {
+        return slugify_corpus(&config.pipeline.corpus);
+    }
+    if !manifest_dir.trim().is_empty() {
+        return slugify_corpus(manifest_dir);
+    }
+    if !config.pipeline.name.trim().is_empty() {
+        return slugify_corpus(&config.pipeline.name);
+    }
+    slugify_corpus(&config.pipeline.target_platform)
 }
 
 /// Deterministic corpus version: sha256 of the canonical YAML (16 hex).
@@ -907,7 +922,6 @@ fn attr_unknown(
 
 async fn store_provenance(
     tx: &mpsc::Sender<MemoryGraphMessage>,
-    platform_id: &str,
     domain: &str,
     corpus_version: &str,
 ) -> Result<()> {
@@ -915,10 +929,9 @@ async fn store_provenance(
     tx.send(MemoryGraphMessage::MergeAttrNode {
         node: attr_unknown(
             Some("rag_provenance".to_string()),
-            format!("rag_provenance:{platform_id}"),
-            Some(format!("platform RAG corpus {corpus_version}")),
+            format!("rag_provenance:{domain}"),
+            Some(format!("domain RAG corpus {corpus_version}")),
             HashMap::from([
-                ("platform_id".to_string(), serde_json::json!(platform_id)),
                 ("domain".to_string(), serde_json::json!(domain)),
                 ("corpus_version".to_string(), serde_json::json!(corpus_version)),
             ]),
@@ -955,25 +968,24 @@ pub async fn ingest_graph_config(
     let config: GraphRagConfig =
         serde_yaml::from_str(&yaml).map_err(|e| anyhow!("bad ingest.yaml: {e}"))?;
 
-    let domain = resolve_domain(&config.pipeline.target_platform);
-    let platform_id = {
-        crate::build_types::Platform::from_registry(&domain)
-            .map(|p| p.id.clone())
-            .unwrap_or_else(|| domain.clone())
-    };
+    let manifest_dir = config_path
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let domain = corpus_domain(&config, &manifest_dir);
     let cv = corpus_version_for(&config);
 
     ensure_domain(&ctx.knowledge_tx, &domain).await?;
     // Provenance is project-optional: when no project store is in scope, skip
     // the project-graph write (the corpus still lives in the KnowledgeStore).
     if project_root.is_some() {
-        store_provenance(&ctx.memory_graph_tx, &platform_id, &domain, &cv).await?;
+        store_provenance(&ctx.memory_graph_tx, &domain, &cv).await?;
     }
 
     info!(
-        "rag_ingest: domain={} platform={} corpus={} sources={}",
+        "rag_ingest: domain={} corpus={} sources={}",
         domain,
-        platform_id,
         cv,
         config.pipeline.sources.len()
     );
@@ -981,7 +993,6 @@ pub async fn ingest_graph_config(
     let patterns = compile_patterns(&config);
     let mut report = IngestReport {
         domain: domain.clone(),
-        platform_id,
         corpus_version: cv,
         ..Default::default()
     };
@@ -1244,4 +1255,52 @@ pub async fn ingest_graph_config(
         domain, report.chunks, report.entities, report.relationships, report.sources_skipped
     );
     Ok(report)
+}
+
+#[cfg(test)]
+mod corpus_domain_tests {
+    use super::*;
+
+    fn cfg(yaml: &str) -> GraphRagConfig {
+        serde_yaml::from_str(yaml).unwrap()
+    }
+
+    #[test]
+    fn explicit_corpus_wins_over_dir() {
+        let c = cfg("pipeline:\n  name: Allwinner A733 GraphRag\n  corpus: My Corpus.Alpha!\n");
+        assert_eq!(corpus_domain(&c, "some-dir"), "my-corpus-alpha");
+    }
+
+    #[test]
+    fn manifest_dir_is_default_corpus() {
+        // legacy verbose fields present — dir still wins, no platform lookup
+        let c = cfg(
+            "pipeline:\n  name: Allwinner A733 GraphRAG Ingestion\n  target_platform: Radxa Cubie A7S/A7A\n",
+        );
+        assert_eq!(corpus_domain(&c, "a7s"), "a7s");
+    }
+
+    #[test]
+    fn name_fallback_when_no_dir_or_corpus() {
+        let c = cfg("pipeline:\n  name: Spire Core Docs\n");
+        assert_eq!(corpus_domain(&c, ""), "spire-core-docs");
+    }
+
+    #[test]
+    fn legacy_target_platform_is_last_resort() {
+        let c = cfg("pipeline:\n  target_platform: swift\n");
+        assert_eq!(corpus_domain(&c, ""), "swift");
+    }
+
+    #[test]
+    fn empty_everything_defaults() {
+        let c = cfg("");
+        assert_eq!(corpus_domain(&c, ""), "default");
+    }
+
+    #[test]
+    fn slugs_collapse_runs_of_separators() {
+        let c = cfg("pipeline:\n  corpus: \"Spire___Core..Docs\"\n");
+        assert_eq!(corpus_domain(&c, ""), "spire-core-docs");
+    }
 }

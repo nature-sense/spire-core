@@ -33,9 +33,9 @@ use crate::actors::rag_ingest::{self, IngestReport, GraphRagConfig};
 /// parsed from the canonical `GraphRagConfig` `ingest.yaml`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RagManifestInfo {
-    /// Registry platform id (resolved from `pipeline.target_platform`).
-    pub platform_id: String,
-    /// Platform domain the manifest ingests into (the RAG retrieval scope).
+    /// Corpus/domain the manifest ingests into (the RAG retrieval scope),
+    /// resolved from the script itself (`pipeline.corpus`, else its
+    /// `knowledge/<corpus>/ingest.yaml` directory name).
     pub domain: String,
     /// Absolute path to the `ingest.yaml` file.
     pub path: String,
@@ -545,13 +545,14 @@ fn list_manifests(project_root: &Path) -> Result<Vec<RagManifestInfo>> {
 fn parse_manifest_info(path: &Path) -> Option<RagManifestInfo> {
     let yaml = std::fs::read_to_string(path).ok()?;
     let config: GraphRagConfig = serde_yaml::from_str(&yaml).ok()?;
-    let domain = rag_ingest::resolve_domain(&config.pipeline.target_platform);
-    let platform_id = crate::build_types::Platform::from_registry(&domain)
-        .map(|p| p.id.clone())
-        .unwrap_or_else(|| domain.clone());
+    let manifest_dir = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let domain = rag_ingest::corpus_domain(&config, &manifest_dir);
     let corpus_version = rag_ingest::corpus_version_for(&config);
     Some(RagManifestInfo {
-        platform_id,
         domain,
         path: path.to_string_lossy().to_string(),
         corpus_version,
