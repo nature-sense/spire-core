@@ -38,6 +38,10 @@ pub enum LlmModelRole {
     /// Coding activities (source generation, fixes) — uses
     /// `config.coding_model` when set.
     Coding,
+    /// Free-form conversational design (AppSpec brainstorm turns, summary and
+    /// spec.md drafting) — prose/markdown, NOT structured JSON. Uses
+    /// `config.planning_model` when set (the same non-reasoning model).
+    Freeform,
 }
 
 /// Messages for the LLM actor.
@@ -189,6 +193,9 @@ impl LlmActor {
             LlmModelRole::Coding if !self.config.coding_model.is_empty() => {
                 self.config.coding_model.clone()
             }
+            LlmModelRole::Freeform if !self.config.planning_model.is_empty() => {
+                self.config.planning_model.clone()
+            }
             _ => self.config.model.clone(),
         };
 
@@ -244,6 +251,21 @@ impl LlmActor {
                 "temperature": 0.2,
                 "frequency_penalty": 0.3,
                 "presence_penalty": 0.3,
+                "stream": false,
+            }),
+            // Free-form conversation (AppSpec brainstorm turns + summary/spec
+            // drafting): prose/markdown. NO `response_format` — DeepSeek rejects
+            // json_object mode whenever the prompt doesn't ask for JSON (HTTP
+            // 400 "Prompt must contain the word 'json'..."). Config temperature
+            // keeps ideation lively; the 8192 budget stops long design replies
+            // from truncating.
+            LlmModelRole::Freeform => serde_json::json!({
+                "model": model,
+                "messages": [
+                    {"role": "user", "content": prompt}
+                ],
+                "max_tokens": 8192,
+                "temperature": self.config.temperature,
                 "stream": false,
             }),
             LlmModelRole::Default => serde_json::json!({
