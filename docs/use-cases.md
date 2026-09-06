@@ -136,3 +136,18 @@ monitoring sites).
 
 Key modules: `spatial` (functions), `AttrNode` spatial helpers, and the
 `SpatialQuery` message. See [`docs/spatial.md`](spatial.md).
+
+## 11. Vector-tile map UIs
+
+**Goal:** an interactive map viewport that renders geotagged nodes as slippy-map
+vector tiles (Singapore-scale, dynamically filtered).
+
+1. Compute the viewport's tile coordinates with
+   `spatial::tile_bounds(z, x, y)` / `point_to_tile(point, z)`.
+2. Ask `TileActor::GetTile` (or `GetTileFeatures`) for each tile — feature sets
+   are LRU-cached per `(filters, z, x, y)`, so panning reuses tiles.
+3. `GetTile` returns MVT bytes (via `crate::tiles::encode_tile`) that the map
+   renderer draws; `GetTileFeatures` returns the underlying nodes for GeoJSON
+   or custom rendering.
+
+Key actors: `TileActor`, `MemoryGraphActor`; key modules: `spatial`, `tiles`.

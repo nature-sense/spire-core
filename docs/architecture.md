@@ -4,7 +4,18 @@
 <!-- Copyright (c) 2026 NatureSense -->
 
 This guide explains how `spire-core` is organised: the actor model, message
-passing, subsystems, and persistence. It assumes familiarity with Tokio.
+passing, subsystems, persistence, and the spatial / tile layers built on the
+graph store. It assumes familiarity with Tokio.
+
+## Architecture in one paragraph
+
+`spire-core` is a library of **message-driven actors**. A generic framework
+(`spire-actor`) provides `Actor`/`ChildActor`/`Subsystem` and a type-checked
+`ServiceRegistry`; domain actors live here and talk only through typed `mpsc`
+mailboxes with oneshot request/reply. The **sole data store** is
+`MemoryGraphActor`, a GQL-fronted wrapper over SeleneDB's `GraphDb`. Read-only
+consumers (RAG, tool orchestration, **spatial queries**, and **vector-tile
+serving**) send it messages; nothing ever touches the low-level `SharedGraph`.
 
 ## The actor model
 
@@ -90,42 +101,14 @@ pub type Responder<T> = oneshot::Sender<Result<T, ActorError>>;
 // A message variant carrying a reply channel:
 pub enum ChatMessage {
     GetActive { reply_to: oneshot::Sender<Option<ChatDialog>> },
-    Append {
-        chat_id: String,
-        content: String,
-        role: String,
-        widget: Option<serde_json::Value>,
-        reply_to: oneshot::Sender<Result<ChatMessageData, ActorError>>,
-    },
+    Append    { message: ChatMessageData, reply_to: Responder<()> },
+    // ...
 }
 ```
 
 Senders are cheap to clone and may outlive the actor (`send()` never blocks for
 long). The actor replies with `let _ = reply_to.send(...);` — the caller's
 receiver may have been dropped, so the result is deliberately ignored.
-
-`ActorError` (from `spire-actor`) is the shared error type for actor replies:
-`Io`, `Serialization`, `ChannelClosed`, `Internal`, `SetupFailed`, `SendError`,
-`RecvError`.
-
-## Actors provided by this crate
-
-| Actor | Location | Responsibility |
-| --- | --- | --- |
-| `ChatActor` | `subsystems::chat` | Chat dialogs + messages, embedded widgets |
-| `MemoryGraphActor` | `subsystems::graph` | **Sole data store**: nodes, edges, vectors, config, GQL, snapshots |
-| `LlmActor` | `subsystems::llm` | LLM completions (single-shot, streaming, tools, roles) |
-| `McpClientActor` | `subsystems::mcp` | Wraps `McpClientManager`; exposes MCP servers/tools |
-| `FileWatcherActor` | `subsystems::tools` | Initial scan + debounced change notifications |
-| `ToolOrchestrator` | `subsystems::tools` | Executes multi-step tool plans with variable resolution |
-| `ProgressActor` | `actors` | Broadcast progress updates |
-| `PromptHandlerActor` | `actors` | LLM prompt lifecycle with context injection *(kept, not yet spawned by the consumer)* |
-| `RagActor` | `actors` | Per-domain RAG retrieval + ingestion control |
-| `SystemPromptActor` | `actors` | Builds/caches the system prompt prefix |
-| `ToolRouterActor` | `actors::tool_providers` | Routes tool calls by name (registry + MCP backends) |
-| `ToolsActor` | `actors` | Tool registration and dispatch |
-| `TransportActor` | `transport::socket` | JSON-RPC 2.0 over TCP to the extension |
-| `FilesystemModule`/`GitModule`/`ProcessModule`/`SearchModule`/`TerminalModule` | `modules` | Long-lived `Actor`s for platform services |
 
 ## Subsystem & module ownership
 
@@ -153,14 +136,45 @@ LLM tool layer can discover module capabilities uniformly.
 - Writes are serialized; reads are lock-free. Snapshots are written on `Sync`.
 - The actor uses **GQL** (`execute_gql_query` / `execute_gql_write`) for all data
   access — the low-level `SharedGraph` API is not used outside `graph.rs`.
-- Spatial queries pre-filter via GQL range scans over the scalar spatial
-  property columns (`latitude`/`longitude` or `min_lng`/`min_lat`/`max_lng`/
-  `max_lat`) and refine with exact WGS84 predicates from `crate::spatial`
-  (bounding box, radius, k-nearest, contains, intersects — distances in
-  meters). Full geometries are optional extras on the `geometry` property.
 
 Data layout: all nodes use the `SpireNode` label; UUID strings and metadata are
-stored as properties. Config is stored on `SpireConfig` nodes.
+stored as properties. Config is stored on `SpireConfig` nodes. Spatial location
+is ordinary scalar properties (`latitude`/`longitude` or
+`min_lng`/`min_lat`/`max_lng`/`max_lat` bounding boxes) plus an optional
+`geometry` property carrying a GeoJSON-serialized geometry.
+
+### Spatial queries (read path)
+
+`MemoryGraphMessage::SpatialQuery` answers geometry questions without any
+schema change. Nodes carry location via the `AttrNode` spatial helpers
+(`set_geo_point`, `set_spatial_geometry`); queries then:
+
+1. **Pre-filter with GQL range scans** over the scalar columns
+   (`latitude`/`longitude` or the `min_*`/`max_*` bounding box) — cheap, indexed
+   later by a SeleneDB typed index if the store grows large.
+2. **Refine with exact WGS84 predicates** from `crate::spatial` (bounding box,
+   radius, k-nearest, contains, intersects — distances in meters) using the
+   `geo` crate on the survivors.
+
+The result is `SpatialQueryResult { nodes, total_results, truncated }`. This is
+the read path behind the vector-tile layer below.
+
+### Vector tiles (read path)
+
+Map UIs consume **slippy-map tiles** (`z/x/y`, Web Mercator). Two layers serve
+them from the same store:
+
+- **Projection** — `crate::spatial::tile_bounds` (tile → lon/lat window),
+  `point_to_tile` and `lonlat_to_tile_coord` (features → tile-local pixels).
+- **`TileActor`** (`src/actors/tile.rs`) — a read-only consumer of the graph.
+  `GetTileFeatures` returns the `AttrNode`s intersecting a tile (LRU-cached per
+  `(filters, z, x, y)`); `GetTile` encodes them to **MVT bytes** via
+  `crate::tiles::encode_tile` (WGS84 → tile-local → clipped protobuf, one layer
+  per `node_type`). The CPU-bound encode runs on a blocking task, off the
+  mailbox.
+
+`TileActor` mirrors `RagActor`: it holds a `memory_graph_tx` sender and never
+owns graph state.
 
 ## ID mapping (UUID ↔ SeleneDB)
 
@@ -197,9 +211,9 @@ and the `spire-code` tool providers.
 - **Never block the mailbox loop**: long or blocking work must be moved to a
   spawned task. `TransportActor`, for example, spawns a task to await an
   extension response so the reader task can keep delivering messages (avoids a
-  re-entrancy deadlock).
+  re-entrancy deadlock). `TileActor` does the same for MVT encoding
+  (`spawn_blocking`).
 - Shared services are wrapped in `Arc` (e.g. the embedder is shared via
   `Arc<dyn Embedder>` inside the sized `EmbedderService`).
 - The `ServiceRegistry` is `Arc<ServiceRegistry>` shared across child systems;
   it is a `Mutex<HashMap>` and is read at init time, not per message.
-

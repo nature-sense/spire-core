@@ -3,17 +3,18 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <!-- Copyright (c) 2026 NatureSense -->
 
-This guide describes the retrieval-augmented generation pipeline in `spire-core`:
-the data model, the `ingest.yaml`-driven ingestion flow, retrieval, and the
-practices that keep ingestion fast, idempotent, and cheap.
+## RAG in one paragraph
+
+RAG in Spire is **per-domain** and **user-level**, not project-scoped. A "domain"
+(e.g. `a7s`) is a retrieval scope for one product/platform. Its corpus lives in
+the shared KnowledgeStore (`config::knowledge_dir()`, default `~/.spire/knowledge`)
+as `rag_domain`, `rag_chunk`, `rag_entity`, `rag_relationship`, and `rag_source`
+nodes in a single SeleneDB instance. `RagActor::Query` re-embeds the query and
+scores chunks by cosine similarity (lexical Jaccard fallback in degraded mode).
+See also [`docs/spatial.md`](spatial.md) for place-aware (spatial + semantic)
+retrieval over the same store.
 
 ## Overview
-
-RAG in Spire is **per-domain** and **user-level**, not project-scoped. A
-"domain" (e.g. `a7s`) is a retrieval scope for one product/platform. Its corpus
-lives in the shared KnowledgeStore (`config::knowledge_dir()`, default
-`~/.spire/knowledge`) as `rag_domain`, `rag_chunk`, `rag_entity`,
-`rag_relationship`, and `rag_source` nodes in a single SeleneDB instance.
 
 ```
 ingest.yaml (GraphRagConfig)
@@ -45,10 +46,9 @@ MemoryGraphActor (knowledge store)     ←─── RagActor::Query
 | `embedder::CandleEmbedder` / `NoopEmbedder` | Local 384-d embedder; fail-loud degraded-mode placeholder. |
 
 The shared embedder is registered in the `ServiceRegistry` under `"embedder"` as
-`EmbedderService(Arc<dyn Embedder>)` (a **sized** wrapper — required because
-`Any::downcast` needs `Sized`, so a raw `Arc<dyn Embedder>` cannot be stored).
-`RagActor::from_registry` resolves it and falls back to `NoopEmbedder` in
-degraded mode.
+`EmbedderService(Arc<dyn Embedder>)` (a **sized** wrapper — `Any::downcast` needs
+`Sized`, so a raw `Arc<dyn Embedder>` cannot be stored). `RagActor::from_registry`
+resolves it and falls back to `NoopEmbedder` in degraded mode.
 
 ## The `ingest.yaml` manifest (`GraphRagConfig`)
 
@@ -82,8 +82,8 @@ output:
 
 Key fields used by the engine:
 
-- **`pipeline.target_platform`** → `resolve_domain()` produces the clean domain
-  id (the retrieval scope).
+- **`pipeline.target_platform`** → `resolve_domain()` produces the clean domain id
+  (the retrieval scope).
 - **`corpus_version_for(config)`** returns a deterministic 16-hex fingerprint of
   the config. The version is stored on the domain node, so re-ingesting an
   unchanged manifest is a cheap no-op; changing the manifest bumps the version
@@ -139,26 +139,11 @@ vectors), scoring falls back to **lexical Jaccard overlap** so the tool keeps
 working — but this is a fallback, not a target. `RagActor::FindInterfaces`
 queries `AstFunction`/`AstClass` interface nodes the same way.
 
-### Spatial + semantic retrieval
-
-Nodes in the same store can carry **both** an embedding and WGS84 location
-(`AttrNode::set_geo_point` / `set_spatial_geometry`). Two application-side
-compositions make retrieval place-aware:
-
-- **Spatial pre-filter → semantic re-rank** — `MemoryGraphMessage::SpatialQuery`
-  (e.g. `Radius`, `Contains`) narrows geotagged nodes to a region, then the
-  survivors are embedded/cosine-ranked.
-- **Semantic candidates → spatial validation** — `RagActor::Query` returns
-  `top_k` chunks; keep only those whose node lies in the region of interest.
-
-See [`docs/spatial.md`](spatial.md) for the storage model and the `SpatialQuery`
-API.
-
 ## Versioning & idempotency
 
-- `corpus_version_for` is a **pure function of the config** → identical
-  manifests always yield the same version, so re-ingesting after a crash or a
-  restart converges instead of duplicating.
+- `corpus_version_for` is a **pure function of the config** → identical manifests
+  always yield the same version, so re-ingesting after a crash or a restart
+  converges instead of duplicating.
 - The version is stored on the `rag_domain` node; `RagDomainInfo.corpus_version`
   exposes it to the UI.
 - Changed manifests produce a new version; stale chunks/entities from the old
@@ -188,4 +173,3 @@ API.
 - **Monitor degraded mode** — if `NoopEmbedder` is ever in play, retrieval
   silently drops to Jaccard; surface a warning when the `"embedder"` service is
   missing at startup.
-

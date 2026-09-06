@@ -7,11 +7,11 @@ Things that break or silently degrade `spire-core`, and what to do instead.
 
 ## 1. `ServiceRegistry::get` on the hot path
 
-`registry.get` locks a `Mutex<HashMap>` and type-checks every call. Doing it
-per message serializes the actor and burns cycles.
+`registry.get` locks a `Mutex<HashMap>` and type-checks every call. Doing it per
+message serializes the actor and burns cycles.
 
 **Instead:** resolve once in `ChildActor::init` (or in the constructor) and cache
-the `mpsc::Sender` in a field. `ChildContext::service` exists exactly for this.
+  the `mpsc::Sender` in a field. `ChildContext::service` exists exactly for this.
 
 ## 2. Blocking the actor's `handle()`
 
@@ -19,8 +19,8 @@ A long synchronous operation inside `handle` stalls the whole mailbox: other
 actors' requests queue up, timers fire late, and the system feels dead.
 
 **Instead:** `tokio::spawn` the slow work and reply from the task (like
-`TransportActor` does for pending extension calls), or delegate to a dedicated
-worker actor.
+`TransportActor` does for pending extension calls, and `TileActor` does for MVT
+encoding via `spawn_blocking`), or delegate to a dedicated worker actor.
 
 ## 3. Touching the low-level `SharedGraph` directly
 
@@ -110,7 +110,7 @@ and fail ingest rather than storing un-embeddable chunks.
 ## 13. Storing coordinates as JSON strings
 
 Spatial queries pre-filter with GQL numeric range predicates
-(`WHERE n.latitude >= …`), which only work on **native scalar number
+(`WHERE n.latitude >= ...`), which only work on **native scalar number
 properties**. Hand-serializing coordinates into a JSON string (e.g. a `geo`
 property that is one blob) makes the node invisible to every range scan, so the
 actor falls back to parsing each candidate — slow and fragile.
@@ -119,4 +119,15 @@ actor falls back to parsing each candidate — slow and fragile.
 `set_spatial_geometry`), which write scalar `latitude`/`longitude` (or
 `min_lng`/`min_lat`/`max_lng`/`max_lat`) columns **and** keep the optional
 `geometry` property for exact `Contains`/`Intersects` refinement. See
-[`docs/spatial.md`](spatial.md).
+[`spatial.md`](spatial.md).
+
+## 14. Assuming every tile query can be a full scan
+
+Map UIs issue many tile queries per viewport. An unindexed O(n) scan per tile
+is fine for small stores (thousands of features) but stops scaling past ~50–100k
+features or dense zooming.
+
+**Instead:** route tiles through `TileActor` (it caches per `(filters, z, x, y)`)
+and, when the store grows, add a SeleneDB typed index on the spatial bounding-box
+columns — or a quadkey/geohash column — so per-tile lookups are O(log n + k)
+rather than O(n).

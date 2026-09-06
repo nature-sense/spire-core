@@ -14,12 +14,13 @@ use async_trait::async_trait;
 use spire_actor::{spawn_child, ChildActor, ChildContext, ServiceRegistry};
 use spire_core::actors::{
     Actor, ActorSystem, ChatActor, ChatMessage, FilesystemMessage, FilesystemModule,
-    MemoryGraphActor, MemoryGraphMessage, RagActor, RagMessage,
+    MemoryGraphActor, MemoryGraphMessage, RagActor, RagMessage, TileActor, TileFilters,
+    TileMessage,
 };
 use spire_core::analyzer::tree_builder::build_file_tree;
 use spire_core::embedder::NoopEmbedder;
 use spire_core::models::embedding::Embedder;
-use spire_core::models::memory_graph::AttrNode;
+use spire_core::models::memory_graph::{AttrNode, SpatialQuery};
 use spire_core::subsystems::chat::chat::ChatDialog;
 
 use tokio::sync::{mpsc, oneshot};
@@ -270,11 +271,76 @@ async fn doc_example_6_store_and_query_graph_node() {
 }
 
 // ============================================================================
-// docs/examples.md → §7 Query a RAG corpus
+// docs/examples.md → §7 Spatial queries on the memory graph
 // ============================================================================
 
 #[tokio::test]
-async fn doc_example_7_query_rag_corpus() {
+async fn doc_example_7_spatial_query() {
+    let system = ActorSystem::new();
+    let (mg_tx, _handle) = system.spawn(MemoryGraphActor::new());
+
+    let dir = tempfile::tempdir().unwrap();
+    let (t, r) = oneshot::channel();
+    mg_tx
+        .send(MemoryGraphMessage::Initialize {
+            data_dir: dir.path().to_path_buf(),
+            reply_to: t,
+        })
+        .await
+        .unwrap();
+    r.await.unwrap().unwrap();
+
+    // A WGS84 point sensor, tagged with the AttrNode spatial helper.
+    let now = chrono::Utc::now();
+    let mut node = AttrNode {
+        id: "s1".to_string(),
+        node_type: "Sensor".to_string(),
+        subtype: None,
+        name: "sensor-nyc".to_string(),
+        description: None,
+        properties: Default::default(),
+        embedding_id: None,
+        created_at: now,
+        updated_at: now,
+        version: 1,
+    };
+    node.set_geo_point(geo::Point::new(-74.006, 40.7128)); // Point::new(lng, lat)
+    let (t, r) = oneshot::channel();
+    mg_tx
+        .send(MemoryGraphMessage::StoreAttrNode { node, reply_to: t })
+        .await
+        .unwrap();
+    r.await.unwrap().unwrap();
+
+    // Intersects query over the slippy-map tile that contains the point.
+    let (x, y) = spire_core::spatial::point_to_tile(&geo::Point::new(-74.006, 40.7128), 12);
+    let (t, r) = oneshot::channel();
+    mg_tx
+        .send(MemoryGraphMessage::SpatialQuery {
+            query: SpatialQuery::Intersects {
+                geometry: geo::Geometry::Rect(spire_core::spatial::tile_bounds(12, x, y)),
+            },
+            node_type: None,
+            subtype: None,
+            limit: Some(50),
+            reply_to: t,
+        })
+        .await
+        .unwrap();
+    let res = r.await.unwrap().unwrap();
+    assert!(
+        res.nodes.iter().any(|hit| hit.node.id == "s1"),
+        "expected the sensor in its tile, got {} hits",
+        res.total_results
+    );
+}
+
+// ============================================================================
+// docs/examples.md → §8 Query a RAG corpus
+// ============================================================================
+
+#[tokio::test]
+async fn doc_example_8_query_rag_corpus() {
     let system = ActorSystem::new();
     let (mg_tx, _handle) = system.spawn(MemoryGraphActor::new());
 
@@ -320,11 +386,11 @@ async fn doc_example_7_query_rag_corpus() {
 }
 
 // ============================================================================
-// docs/examples.md → §8 Call a platform module
+// docs/examples.md → §9 Call a platform module
 // ============================================================================
 
 #[tokio::test]
-async fn doc_example_8_call_platform_module() {
+async fn doc_example_9_call_platform_module() {
     let system = ActorSystem::new();
     let (fs_tx, _handle) = system.spawn(FilesystemModule::new());
 
@@ -347,11 +413,11 @@ async fn doc_example_8_call_platform_module() {
 }
 
 // ============================================================================
-// docs/examples.md → §9 Global config
+// docs/examples.md → §10 Global config
 // ============================================================================
 
 #[tokio::test]
-async fn doc_example_9_global_config() {
+async fn doc_example_10_global_config() {
     // Serialize env-var mutation and point SPIRE_CONFIG_DIR at a temp dir so the
     // developer's real ~/.spire is never touched.
     let _guard = CONFIG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -377,4 +443,69 @@ async fn doc_example_9_global_config() {
         Some(v) => std::env::set_var("SPIRE_CONFIG_DIR", v),
         None => std::env::remove_var("SPIRE_CONFIG_DIR"),
     }
+}
+
+// ============================================================================
+// docs/examples.md → §11 Vector tiles for the map UI
+// ============================================================================
+
+#[tokio::test]
+async fn doc_example_11_vector_tiles() {
+    let system = ActorSystem::new();
+    let (mg_tx, _handle) = system.spawn(MemoryGraphActor::new());
+
+    let dir = tempfile::tempdir().unwrap();
+    let (t, r) = oneshot::channel();
+    mg_tx
+        .send(MemoryGraphMessage::Initialize {
+            data_dir: dir.path().to_path_buf(),
+            reply_to: t,
+        })
+        .await
+        .unwrap();
+    r.await.unwrap().unwrap();
+
+    // A Singapore sensor; tile (807, 508) at z10 contains (103.85, 1.35).
+    let now = chrono::Utc::now();
+    let mut node = AttrNode {
+        id: "s1".to_string(),
+        node_type: "Sensor".to_string(),
+        subtype: None,
+        name: "sensor-sg".to_string(),
+        description: None,
+        properties: Default::default(),
+        embedding_id: None,
+        created_at: now,
+        updated_at: now,
+        version: 1,
+    };
+    node.set_geo_point(geo::Point::new(103.85, 1.35));
+    let (t, r) = oneshot::channel();
+    mg_tx
+        .send(MemoryGraphMessage::StoreAttrNode { node, reply_to: t })
+        .await
+        .unwrap();
+    r.await.unwrap().unwrap();
+
+    // TileActor over the same graph.
+    let (tile_tx, _th) = system.spawn(TileActor::new(mg_tx));
+
+    // MVT bytes for the z10 tile.
+    let filters = TileFilters {
+        node_type: Some("Sensor".to_string()),
+        ..Default::default()
+    };
+    let (t, r) = oneshot::channel();
+    tile_tx
+        .send(TileMessage::GetTile {
+            filters,
+            z: 10,
+            x: 807,
+            y: 508,
+            reply_to: t,
+        })
+        .await
+        .unwrap();
+    let mvt = r.await.unwrap().unwrap();
+    assert!(!mvt.is_empty(), "expected encoded MVT bytes");
 }

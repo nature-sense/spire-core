@@ -397,6 +397,7 @@ println!("deepseek key set: {}", key.is_some());
 
 A full end-to-end ingestion example that exercises the real KnowledgeStore is in
 [`examples/rag_ingest_check.rs`](../examples/rag_ingest_check.rs).
+
 ## 11. Vector tiles for the map UI
 
 ```rust

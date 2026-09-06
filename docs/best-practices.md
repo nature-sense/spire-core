@@ -14,20 +14,21 @@ Patterns that keep `spire-core` actors fast, correct, and maintainable.
 - **Register every long-lived sender under a stable string name** in the
   `ServiceRegistry` at spawn time. Consumers resolve by name + type; a wrong type
   lookup returns `None` (fail fast, no silent `Any`-downcast panics).
-- **`ActorSystem::spawn` returns `(Sender, JoinHandle)`** — keep the sender,
-  and keep the handle if you need graceful shutdown or task supervision.
+- **`ActorSystem::spawn` returns `(Sender, JoinHandle)`** — keep the sender, and
+  keep the handle if you need graceful shutdown or task supervision.
 
 ## Message passing
 
 - **Use oneshot request/reply for everything that needs an answer.** Pass the
   `oneshot::Sender` inside the message (the `Responder<T>` pattern).
-- **Never block the mailbox loop.** Long I/O, HTTP, model loads, or socket waits
-  belong in a `tokio::spawn`ed task (see `TransportActor::CallExtension`, which
-  spawns the response-waiter so the reader loop keeps draining the socket).
+- **Never block the mailbox loop.** Long I/O, HTTP, model loads, CPU-bound work,
+  or socket waits belong in a `tokio::spawn`ed task (see
+  `TransportActor::CallExtension` and `TileActor::get_tile`, which runs MVT
+  encoding on `spawn_blocking`).
 - **Ignore the result of `reply_to.send(...)`** with `let _ =` — the caller may
   have timed out or dropped its receiver.
-- **Prefer fire-and-forget `mpsc::Sender::send` over unbounded channels.** The
-  default mailbox is bounded (32); design messages to be cheap to enqueue.
+- **Prefer bounded channels.** The default mailbox is bounded (32); design
+  messages to be cheap to enqueue.
 
 ## Tools & MCP
 
@@ -52,18 +53,21 @@ Patterns that keep `spire-core` actors fast, correct, and maintainable.
 ## Spatial queries
 
 - **Store location with the `AttrNode` helpers**, never by hand-writing JSON.
-  `set_geo_point` / `set_spatial_geometry` keep the scalar `min_lng`/`min_lat`/
-  `max_lng`/`max_lat` bounding-box columns in sync — the GQL pre-filter scans
-  exactly those columns.
+  `set_geo_point` / `set_spatial_geometry` keep the scalar
+  `min_lng`/`min_lat`/`max_lng`/`max_lat` bounding-box columns in sync — the GQL
+  pre-filter scans exactly those columns.
 - **Coordinates must be scalar numbers.** Range predicates
-  (`WHERE n.latitude >= …`) only match native numeric properties; a JSON-encoded
-  coordinate string is opaque to GQL.
+  (`WHERE n.latitude >= ...`) only match native numeric properties; a
+  JSON-encoded coordinate string is opaque to GQL.
 - **Use `MemoryGraphMessage::SpatialQuery`, not hand-rolled geometry loops.**
   The actor pre-filters by bounding box and refines with the exact `geo`
   predicates in `crate::spatial` (bounding box, radius, k-nearest, contains,
-  intersects — all in WGS84 lon/lat, distances in meters).
+  intersects — WGS84 lon/lat, distances in meters).
 - **Query with a filter budget.** Pass `node_type`/`subtype` and keep `limit`
   small; `total_results`/`truncated` on the result tell you when you capped.
+- **Serve tiles through `TileActor`** — it caches per `(filters, z, x, y)`, so
+  panning a viewport never re-queries the store for the same tile. Keep the
+  MVT encode on a blocking task, off the mailbox.
 
 ## Embeddings & RAG
 

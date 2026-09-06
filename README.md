@@ -12,12 +12,12 @@ This document is the crate overview. Detailed guides live in [`docs/`](docs/):
 
 | Guide | Contents |
 | --- | --- |
-| [`docs/architecture.md`](docs/architecture.md) | Actor model, message-passing, subsystems, persistence |
+| [`docs/architecture.md`](docs/architecture.md) | Actor model, message-passing, subsystems, persistence, spatial + tile layers |
 | [`docs/api.md`](docs/api.md) | Per-module API reference |
 | [`docs/rag.md`](docs/rag.md) | RAG knowledge store and efficient ingestion |
+| [`docs/spatial.md`](docs/spatial.md) | WGS84 spatial queries + MVT vector tiles over the memory graph |
 | [`docs/use-cases.md`](docs/use-cases.md) | Real-world usage patterns |
 | [`docs/examples.md`](docs/examples.md) | Runnable code examples |
-| [`docs/spatial.md`](docs/spatial.md) | WGS84 spatial queries over the memory graph |
 | [`docs/best-practices.md`](docs/best-practices.md) | Recommended patterns |
 | [`docs/anti-patterns.md`](docs/anti-patterns.md) | Things to avoid |
 
@@ -43,8 +43,8 @@ Spire AI coding platform:
 - **Spatial queries** — WGS84 geometry over the knowledge graph: bounding box,
   radius, k-nearest, contains, and intersects (`spatial` functions +
   `MemoryGraphMessage::SpatialQuery`).
-- **Vector tiles** — `TileActor` + `tiles` encoder turn spatial features into
-  cached MVT bytes for map UIs (`GetTile` / `GetTileFeatures`).
+- **Vector tiles** — `TileActor` + the `tiles` encoder turn spatial features
+  into cached MVT bytes for map UIs (`GetTile` / `GetTileFeatures`).
 - **Embedding** — local text embeddings via Candle (`all-MiniLM-L6-v2`, 384-d).
 - **LLM client** — DeepSeek-compatible completions, streaming, and
   tool/role-aware calls (`LlmActor`).
@@ -62,29 +62,30 @@ Spire AI coding platform:
 ## Architecture at a glance
 
 ```
-            ┌────────────────────────────────────────────────┐
-            │           spire-code (consumer crate)          │
-            │   ffi.rs / main.rs / coding actors             │
-            └──────────────┬─────────────────────────────────┘
-                           │ uses (library API)
-┌──────────────────────────▼─────────────────────────────────┐
-│                       spire-core                            │
-│  ActorSystem  ── spawns ──►  actors / subsystems / modules  │
-│  ServiceRegistry ── keyed sender + service lookup           │
-│                                                             │
-│   ├── subsystem::chat     ChatActor                         │
-│   ├── subsystem::graph    MemoryGraphActor ──► GraphDb      │
-│   ├── subsystem::llm      LlmActor                          │
-│   ├── subsystem::mcp      McpClientActor ──► McpClientManager
-│   ├── subsystem::tools    FileWatcherActor, ToolOrchestrator
-│   ├── actors              Progress, SystemPrompt, RagActor, │
-│   │                        ToolRouter, Tools, WebSearch     │
-│   ├── modules             Filesystem, Git, Process, Search, │
-│   │                        Terminal                         │
-│   ├── transport           TransportActor (JSON-RPC over TCP)│
-│   ├── embedder            CandleEmbedder / NoopEmbedder     │
-│   └── analyzer            scanner, tree_builder             │
-└─────────────────────────────────────────────────────────────┘
+             ┌────────────────────────────────────────────────┐
+             │           spire-code (consumer crate)          │
+             │   ffi.rs / main.rs / coding actors             │
+             └──────────────┬─────────────────────────────────┘
+                            │ uses (library API)
+ ┌──────────────────────────▼─────────────────────────────────┐
+ │                       spire-core                            │
+ │  ActorSystem  ── spawns ──►  actors / subsystems / modules  │
+ │  ServiceRegistry ── keyed sender + service lookup           │
+ │                                                             │
+ │   ├── subsystem::chat     ChatActor                         │
+ │   ├── subsystem::graph    MemoryGraphActor ──► GraphDb      │
+ │   ├── subsystem::llm      LlmActor                          │
+ │   ├── subsystem::mcp      McpClientActor ──► MCP servers    │
+ │   ├── subsystem::tools    FileWatcherActor, ToolOrchestrator│
+ │   ├── actors::rag         RagActor / rag_ingest             │
+ │   ├── actors::tile        TileActor (spatial → MVT tiles)   │
+ │   ├── modules             Filesystem, Git, Process, Search, │
+ │   │                       Terminal                          │
+ │   ├── transport           TransportActor (JSON-RPC over TCP)│
+ │   ├── spatial + tiles     WGS84 geometry / MVT encoding     │
+ │   ├── embedder            CandleEmbedder / NoopEmbedder     │
+ │   └── analyzer            scanner, tree_builder             │
+ └─────────────────────────────────────────────────────────────┘
 ```
 
 Every component is message-driven. Actors are spawned by the consumer
@@ -96,10 +97,10 @@ name + type at `init` time and cached — never on the hot path.
 
 | Module | Purpose |
 | --- | --- |
-| [`actors`](src/actors/mod.rs) | Directly-spawned actors: `progress`, `prompt_handler`, `rag`, `rag_ingest`, `system_prompt`, `tool_providers`, `tools`, `web_search`, plus the `messages` module (`ToolInfo`, `ToolMessage`) and legacy re-exports. |
+| [`actors`](src/actors/mod.rs) | Directly-spawned actors: `progress`, `prompt_handler`, `rag`, `rag_ingest`, `system_prompt`, `tile`, `tool_providers`, `tools`, `web_search`, plus the `messages` module (`ToolInfo`, `ToolMessage`) and legacy re-exports. |
 | [`subsystems`](src/subsystems/mod.rs) | Cohesive actor groups by domain: `chat`, `graph`, `llm`, `mcp`, `tools`. |
 | [`modules`](src/modules/mod.rs) | Static child actors: filesystem, git, process, search, terminal. |
-| [`models`](src/models/mod.rs) | Data models: `embedding` (`Embedder`, `Embedding`), `memory_graph` (`AttrNode`, relationships, transactions), `analysis`. |
+| [`models`](src/models/mod.rs) | Data models: `embedding` (`Embedder`, `Embedding`), `memory_graph` (`AttrNode`, relationships, spatial query types, transactions), `analysis`. |
 | [`embedder`](src/embedder/mod.rs) | `CandleEmbedder` (all-MiniLM-L6-v2) and the fail-loud `NoopEmbedder`. |
 | [`mcp`](src/mcp/mod.rs) | `McpClientManager` — external MCP server connections. |
 | [`analyzer`](src/analyzer/mod.rs) | Filesystem scanning (`scanner`) and file-tree building (`tree_builder`). |
@@ -107,7 +108,7 @@ name + type at `init` time and cached — never on the hot path.
 | [`config`](src/config.rs) | User-level config (`~/.spire`), LLM settings, knowledge dir. |
 | [`build_types`](src/build_types.rs) | Cross-platform build metadata contract types. |
 | [`platform`](src/platform.rs) | Cross-compilation platform definitions and cross-file generation. |
-| [`spatial`](src/spatial.rs) | Pure WGS84 geometry: haversine distance, bounding boxes, contains/intersects predicates (backing `SpatialQuery`). |
+| [`spatial`](src/spatial.rs) | Pure WGS84 geometry: haversine distance, bounding boxes, contains/intersects predicates, slippy-map projection (backing `SpatialQuery`). |
 | [`tiles`](src/tiles.rs) | MVT (Mapbox Vector Tile) encoding of graph features for map UIs. |
 | [`transport`](src/transport/mod.rs) | `TransportActor` — JSON-RPC 2.0 over TCP. |
 
@@ -157,6 +158,16 @@ fetches, extracts, chunks, batch-embeds, and stores chunks/entities/relationship
 into the shared knowledge store; `RagActor::Query` re-embeds the query and scores
 chunks by cosine similarity (lexical Jaccard fallback in degraded mode). See
 [`docs/rag.md`](docs/rag.md).
+
+## Spatial & vector tiles in one paragraph
+
+Graph nodes can carry WGS84 location — a `latitude`/`longitude` point or an
+arbitrary polygon geometry — and `MemoryGraphMessage::SpatialQuery` answers
+bounding-box, radius, k-nearest, contains, and intersects questions over them
+(see [`docs/spatial.md`](docs/spatial.md)). The same store feeds map UIs:
+`tile_bounds` maps a slippy-map `z/x/y` to a lon/lat window, `TileActor` serves
+the matching features (LRU-cached per tile), and `crate::tiles::encode_tile`
+encodes them into MVT bytes.
 
 ## License
 

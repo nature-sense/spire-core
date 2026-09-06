@@ -8,7 +8,7 @@ item's **signature**, its **purpose**, and any usage **notes**. Types marked
 *re-export* are defined elsewhere and re-exported at the given path.
 
 - [`actors`](#actors) — `messages`, `progress`, `tools`, `web_search`, `rag`,
-  `rag_ingest`, `system_prompt`, `tool_providers`, `prompt_handler`
+  `rag_ingest`, `system_prompt`, `tile`, `tool_providers`, `prompt_handler`
 - [`subsystems`](#subsystems) — `chat`, `graph`, `llm`, `mcp`, `tools`
 - [`modules`](#modules) — filesystem, git, process, search, terminal
 - [`models`](#models) — `embedding`, `memory_graph`, `analysis`
@@ -21,6 +21,7 @@ item's **signature**, its **purpose**, and any usage **notes**. Types marked
 - [`transport`](#transport) — `socket`
 - [`build_types`](#build-types)
 - [`spatial`](#spatial) — WGS84 geometry functions behind the memory graph's spatial queries
+- [`tiles`](#tiles) — MVT encoding of graph features for map UIs
 
 ---
 
@@ -165,6 +166,29 @@ pub struct SourceStatus { /* id, status, chunks, files, reason */ }
 full ingest: fetch sources → extract → chunk → batch-embed → store
 chunks/entities/relationships → persist per-source status. See
 [`rag.md`](rag.md).
+
+### `actors::tile` — `TileActor`
+
+```rust
+pub struct TileFilters { pub node_type: Option<String>, pub subtype: Option<String>,
+                         pub limit: Option<usize> }
+
+pub enum TileMessage {
+    GetTileFeatures { filters: TileFilters, z: u8, x: u32, y: u32,
+                      reply_to: oneshot::Sender<Result<Vec<AttrNode>>> },
+    GetTile        { filters: TileFilters, z: u8, x: u32, y: u32,
+                      reply_to: oneshot::Sender<Result<Vec<u8>>> },   // MVT bytes
+    ClearCache     { reply_to: oneshot::Sender<()> },
+}
+pub fn TileActor::new(memory_graph_tx: mpsc::Sender<MemoryGraphMessage>) -> Self
+pub fn TileActor::with_capacity(capacity: usize) -> Self
+```
+**Purpose:** serve slippy-map tile feature sets (and MVT bytes) for map UIs from
+the memory graph. Mirrors `RagActor`: it holds a `memory_graph_tx` sender and
+never owns graph state.
+**Notes:** `GetTileFeatures`/`GetTile` translate `z/x/y` via `spatial::tile_bounds`
+and run a `SpatialQuery::Intersects`; results are LRU-cached per
+`(filters, z, x, y)`. MVT encoding runs on a blocking task (see `tiles`).
 
 ### `actors::system_prompt` — `SystemPromptActor`
 
