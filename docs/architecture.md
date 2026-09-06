@@ -153,7 +153,11 @@ LLM tool layer can discover module capabilities uniformly.
 - Writes are serialized; reads are lock-free. Snapshots are written on `Sync`.
 - The actor uses **GQL** (`execute_gql_query` / `execute_gql_write`) for all data
   access — the low-level `SharedGraph` API is not used outside `graph.rs`.
-- `GraphDbTransaction` (`WriteTxn`) commits on drop (RAII).
+- Spatial queries pre-filter via GQL range scans over the scalar spatial
+  property columns (`latitude`/`longitude` or `min_lng`/`min_lat`/`max_lng`/
+  `max_lat`) and refine with exact WGS84 predicates from `crate::spatial`
+  (bounding box, radius, k-nearest, contains, intersects — distances in
+  meters). Full geometries are optional extras on the `geometry` property.
 
 Data layout: all nodes use the `SpireNode` label; UUID strings and metadata are
 stored as properties. Config is stored on `SpireConfig` nodes.

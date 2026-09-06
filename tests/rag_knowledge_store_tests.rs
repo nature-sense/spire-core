@@ -21,11 +21,11 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use spire_core::subsystems::graph::memory_graph::MemoryGraphActor;
 use spire_core::actors::rag::{RagActor, RagMessage};
 use spire_core::actors::Actor;
 use spire_core::embedder::create_embedder;
 use spire_core::models::embedding::Embedder;
+use spire_core::subsystems::graph::memory_graph::MemoryGraphActor;
 
 use tokio::sync::{mpsc, oneshot};
 
@@ -143,18 +143,21 @@ fn write_ingest_config(tmp: &std::path::Path) -> (PathBuf, PathBuf) {
     std::fs::create_dir_all(&docs).unwrap();
     std::fs::write(
         docs.join("NPU.md"),
-        "# A733 NPU pipeline\n\nThe A733 packs an 8-core CPU and a 3 TOPS NPU.\n"
-    ).unwrap();
+        "# A733 NPU pipeline\n\nThe A733 packs an 8-core CPU and a 3 TOPS NPU.\n",
+    )
+    .unwrap();
     std::fs::write(
         docs.join("ISP.md"),
-        "# Camera ISP\n\nV4L2_PIX_FMT_NV12M frames flow from MIPI CSI-2 to the ISP.\n"
-    ).unwrap();
+        "# Camera ISP\n\nV4L2_PIX_FMT_NV12M frames flow from MIPI CSI-2 to the ISP.\n",
+    )
+    .unwrap();
     // Co-locate both entity types in ONE chunk so the
     // npu_blocks ↔ camera_formats relationship can be inferred.
     std::fs::write(
         docs.join("pipeline.md"),
-        "# NPU camera pipeline\n\nNPU_0 receives V4L2_PIX_FMT_NV12M frames from the ISP.\n"
-    ).unwrap();
+        "# NPU camera pipeline\n\nNPU_0 receives V4L2_PIX_FMT_NV12M frames from the ISP.\n",
+    )
+    .unwrap();
 
     let manifest_path = dir.join("ingest.yaml");
     std::fs::write(
@@ -216,7 +219,8 @@ async fn knowledge_store_split_ingest_and_share() {
     let knowledge_tx = spawn_graph(&tmp.path().join("knowledge"), &embedder).await;
 
     let (rag_tx, rx) = mpsc::channel(64);
-    let _join = RagActor::new(knowledge_tx.clone(), project_tx_a.clone(), embedder.clone()).spawn(rx);
+    let _join =
+        RagActor::new(knowledge_tx.clone(), project_tx_a.clone(), embedder.clone()).spawn(rx);
 
     let (manifest_path, _docs) = write_ingest_config(tmp.path());
     {
@@ -232,34 +236,64 @@ async fn knowledge_store_split_ingest_and_share() {
         let report = r.await.unwrap().expect("ingest config");
         eprintln!(
             "REPORT: domain={} chunks={} entities={} rels={} skipped={:?}",
-            report.domain, report.chunks, report.entities, report.relationships, report.sources_skipped
+            report.domain,
+            report.chunks,
+            report.entities,
+            report.relationships,
+            report.sources_skipped
         );
         assert!(report.chunks > 0, "must ingest at least one chunk");
         assert_eq!(report.domain, "a7s");
         assert!(report.entities > 0, "must extract at least one entity");
-        assert!(report.relationships > 0, "must infer at least one relationship");
+        assert!(
+            report.relationships > 0,
+            "must infer at least one relationship"
+        );
     }
 
     // Chunks + entities in the KnowledgeStore; none in the project store.
     let know_chunks = query_prefix(&knowledge_tx, "rag_chunk").await;
     let know_entities = query_prefix(&knowledge_tx, "rag_entity").await;
-    assert!(!know_chunks.is_empty(), "chunks must land in KnowledgeStore");
-    assert!(!know_entities.is_empty(), "entities must land in KnowledgeStore");
-    assert!(know_chunks.iter().all(|n| n.starts_with("rag_chunk:")), "{:?}", know_chunks);
-    assert!(know_entities.iter().all(|n| n.starts_with("rag_entity:")), "{:?}", know_entities);
+    assert!(
+        !know_chunks.is_empty(),
+        "chunks must land in KnowledgeStore"
+    );
+    assert!(
+        !know_entities.is_empty(),
+        "entities must land in KnowledgeStore"
+    );
+    assert!(
+        know_chunks.iter().all(|n| n.starts_with("rag_chunk:")),
+        "{:?}",
+        know_chunks
+    );
+    assert!(
+        know_entities.iter().all(|n| n.starts_with("rag_entity:")),
+        "{:?}",
+        know_entities
+    );
 
     let proj_chunks = query_prefix(&project_tx_a, "rag_chunk").await;
-    assert!(proj_chunks.is_empty(), "project store must NOT hold the corpus");
+    assert!(
+        proj_chunks.is_empty(),
+        "project store must NOT hold the corpus"
+    );
 
     // ── 2. Fresh project B: EMPTY project store, same domain query ──
     let project_b = tmp.path().join("proj-b");
     std::fs::create_dir_all(&project_b).unwrap();
     let project_tx_b = spawn_graph(&project_b.join(".spire").join("data"), &embedder).await;
     let proj_b_chunks = query_prefix(&project_tx_b, "rag_chunk").await;
-    assert!(proj_b_chunks.is_empty(), "fresh project must start with no corpus");
+    assert!(
+        proj_b_chunks.is_empty(),
+        "fresh project must start with no corpus"
+    );
 
     let hits = query_rag(&rag_tx, "a7s", "NPU").await;
-    assert!(!hits.is_empty(), "shared KnowledgeStore must resolve the query");
+    assert!(
+        !hits.is_empty(),
+        "shared KnowledgeStore must resolve the query"
+    );
     assert!(hits.iter().all(|h| h.domain == "a7s"));
 
     // ── 3. Idempotent re-ingest: same config → same content-addressed ids ──
@@ -278,12 +312,24 @@ async fn knowledge_store_split_ingest_and_share() {
         // `report.entities` counts per-chunk MENTIONS; the store holds unique
         // content-addressed nodes (an entity mentioned in N chunks = one node).
         // Compare store-level sets for idempotency.
-        assert_eq!(report.chunks as usize, know_chunks.len(), "re-ingest UPSERTs, no duplicates");
+        assert_eq!(
+            report.chunks as usize,
+            know_chunks.len(),
+            "re-ingest UPSERTs, no duplicates"
+        );
     }
     let know_chunks2 = query_prefix(&knowledge_tx, "rag_chunk").await;
     let know_entities2 = query_prefix(&knowledge_tx, "rag_entity").await;
-    assert_eq!(know_chunks.len(), know_chunks2.len(), "same config → identical graph id set");
-    assert_eq!(know_entities.len(), know_entities2.len(), "entity set idempotent");
+    assert_eq!(
+        know_chunks.len(),
+        know_chunks2.len(),
+        "same config → identical graph id set"
+    );
+    assert_eq!(
+        know_entities.len(),
+        know_entities2.len(),
+        "entity set idempotent"
+    );
     let mut a = know_chunks.clone();
     let mut b = know_chunks2.clone();
     a.sort();
@@ -321,7 +367,9 @@ async fn knowledge_store_split_ingest_and_share() {
             .unwrap();
         let manifests = r.await.unwrap().expect("list manifests");
         assert!(
-            manifests.iter().any(|m| m.domain == "a7s" && m.path.ends_with("ingest.yaml")),
+            manifests
+                .iter()
+                .any(|m| m.domain == "a7s" && m.path.ends_with("ingest.yaml")),
             "the a7s ingest.yaml must be discovered: {:?}",
             manifests
         );
@@ -362,11 +410,17 @@ async fn ingest_without_project() {
         .unwrap();
     let report = r.await.unwrap().expect("ingest without project");
 
-    assert!(report.chunks > 0, "ingest must work with no project: {:?}", report);
-    assert!(report.entities > 0, "entity extraction works without a project");
+    assert!(
+        report.chunks > 0,
+        "ingest must work with no project: {:?}",
+        report
+    );
+    assert!(
+        report.entities > 0,
+        "entity extraction works without a project"
+    );
 
     // The corpus is queryable from the shared KnowledgeStore.
     let hits = query_rag(&rag_tx, "a7s", "NPU").await;
     assert!(!hits.is_empty(), "query works without any project open");
 }
-

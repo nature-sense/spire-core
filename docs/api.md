@@ -20,6 +20,7 @@ item's **signature**, its **purpose**, and any usage **notes**. Types marked
 - [`platform`](#platform)
 - [`transport`](#transport) — `socket`
 - [`build_types`](#build-types)
+- [`spatial`](#spatial) — WGS84 geometry functions behind the memory graph's spatial queries
 
 ---
 
@@ -268,6 +269,9 @@ pub enum MemoryGraphMessage {
     SearchContext      { query, options: SearchOptions, reply_to: Responder<Vec<ContextSearchResult>> },
     AddMemory          { entry: MemoryEntry, reply_to: Responder<()> },
     Recall             { reply_to: Responder<Vec<MemoryEntry>> },
+    // Spatial
+    SpatialQuery { query: SpatialQuery, node_type, subtype, limit,
+                   reply_to: Responder<SpatialQueryResult> },
     // Config
     SetConfig { key, value, reply_to: Responder<()> },  GetConfig { key, reply_to: Responder<...> },
     BootstrapMcpConfig { reply_to: Responder<()> },     GetMcpConfig { reply_to: Responder<McpConfigFile> },
@@ -482,6 +486,8 @@ pub struct AttrNode { pub id: String, pub node_type: String, pub subtype: Option
                       pub version: u32 }
 // + typed accessors: get, u32_prop, f64_prop, bool_prop, str_prop,
 //                    str_array_prop, is(node_type), diagnostic(), …
+// + spatial accessors: geo_point, geo_bounds, spatial_geometry,
+//                      set_geo_point(Point), set_spatial_geometry(Geometry)
 pub struct NodeUpdate { /* partial update envelope */ }
 pub enum RelationshipType { /* typed relation kinds + Custom(String) */ }
 pub struct RelationshipInput { /* from, to, rel_type, properties */ }
@@ -489,7 +495,16 @@ pub struct GraphEdge { /* id, from, to, edge_type, properties */ }
 pub struct SearchOptions { /* filters, limit, embedding-based search flags */ }
 pub struct ContextSearchResult { /* node + score + provenance */ }
 pub struct ScoredNode { pub node: AttrNode, pub score: f32, pub source: RetrievalSource }
-pub enum RetrievalSource { Vector, Gql, /* … */ }
+pub enum RetrievalSource { Vector, Gql, Spatial, /* … */ }
+pub enum SpatialQuery {
+    BoundingBox { rect: Rect<f64> },
+    Nearest     { center: Point<f64>, k: usize },
+    Radius      { center: Point<f64>, radius_meters: f64 },
+    Contains    { geometry: Geometry<f64> },
+    Intersects  { geometry: Geometry<f64> },
+}
+pub struct DistanceScoredNode { pub node: AttrNode, pub distance_meters: Option<f64> }
+pub struct SpatialQueryResult { /* nodes: Vec<DistanceScoredNode>, total_results, truncated */ }
 pub struct TraversalOptions { pub direction: TraversalDirection, pub max_depth: usize, /* … */ }
 pub enum TraversalDirection { Outgoing, Incoming, Both }
 pub struct TraversalResult { pub paths: Vec<TraversalPath> }
@@ -657,6 +672,86 @@ outside `graph.rs`.
 **Notes:** contains `unsafe impl Send/Sync` (the wrapper is thread-safe by
 construction); its `#[cfg(test)]` suite exercises CRUD, GQL, vector search, and
 WAL recovery.
+
+## spatial
+
+Pure WGS84 (EPSG:4326) geometry functions powering
+`MemoryGraphMessage::SpatialQuery`. Longitude/latitude order (`x` = lon,
+`y` = lat); geodesic distances in meters.
+
+```rust
+pub const PROP_LATITUDE: &str = "latitude";      pub const PROP_LONGITUDE: &str = "longitude";
+pub const PROP_ALTITUDE: &str = "altitude";
+pub const PROP_MIN_LNG/MIN_LAT/MAX_LNG/MAX_LAT: &str;   // pre-computed bbox columns
+pub const PROP_GEOMETRY: &str = "geometry";      // full geometry (GeoJSON-serialized)
+
+pub fn haversine_meters(a: &Point<f64>, b: &Point<f64>) -> f64;
+pub fn bounding_box_for_radius(center: &Point<f64>, radius_meters: f64) -> Rect<f64>;
+pub fn geometry_bounds(g: &Geometry<f64>) -> Option<Rect<f64>>;
+pub fn point_in_rect(p: &Point<f64>, rect: &Rect<f64>) -> bool;
+pub fn rects_intersect(a: &Rect<f64>, b: &Rect<f64>) -> bool;
+pub fn geometry_contains_point(g: &Geometry<f64>, p: &Point<f64>) -> bool; // boundary-inclusive
+pub fn geometry_contains(a: &Geometry<f64>, b: &Geometry<f64>) -> bool;    // fully contains
+pub fn geometries_intersect(a: &Geometry<f64>, b: &Geometry<f64>) -> bool; // any shared point
+pub fn distance_point_to_geometry(p: &Point<f64>, g: &Geometry<f64>) -> f64; // 0 when inside
+pub fn tile_bounds(z: u8, x: u32, y: u32) -> Rect<f64>;      // slippy tile -> lon/lat
+pub fn point_to_tile(p: &Point<f64>, z: u8) -> (u32, u32);
+pub fn lonlat_to_tile_coord(lon, lat, z, x, y, extent) -> (f64, f64); // tile-local px
+```
+
+**Purpose:** geometry "functions" layer behind the graph actor — see
+[`models::memory_graph`](#modelsmemory_graph) for `SpatialQuery` /
+`SpatialQueryResult` and the `AttrNode` spatial accessors, and the graph
+section for the `SpatialQuery` message.
+**Notes:** built on the `geo` crate (geo-types re-exported as `geo`).
+
+**Example** (tag a node with a point, then ask a bounding-box question):
+
+```rust
+use spire_core::actors::MemoryGraphMessage;
+use spire_core::models::memory_graph::{AttrNode, SpatialQuery};
+use tokio::sync::oneshot;
+
+// Tag the node with WGS84 coordinates, then store it as usual.
+let mut sensor = AttrNode { /* … */ };
+sensor.set_geo_point(geo::Point::new(-74.006, 40.7128)); // Point::new(lng, lat)
+
+let (t, r) = oneshot::channel();
+mg_tx.send(MemoryGraphMessage::StoreAttrNode { node: sensor, reply_to: t }).await.unwrap();
+r.await.unwrap().unwrap();
+
+// Nodes whose bounding box lies inside the rectangle.
+let (t, r) = oneshot::channel();
+mg_tx.send(MemoryGraphMessage::SpatialQuery {
+    query: SpatialQuery::BoundingBox {
+        rect: geo::Rect::new(geo::Coord { x: -74.5, y: 40.5 }, geo::Coord { x: -73.5, y: 41.0 }),
+    },
+    node_type: None,
+    subtype: None,
+    limit: Some(50),
+    reply_to: t,
+}).await.unwrap();
+let hits = r.await.unwrap().unwrap();
+for hit in hits.nodes {
+    println!("{} — distance: {:?} m", hit.node.name, hit.distance_meters);
+}
+```
+
+## tiles
+
+MVT (Mapbox Vector Tile) encoding from graph features — the pure, stateless
+layer used by `TileActor` (see `subsystems::graph`/`actors`). Feeds map UIs:
+features -> WGS84 -> tile-local (Web Mercator, extent 4096) -> clipped MVT bytes.
+
+```rust
+pub fn encode_tile(features: &[AttrNode], z: u8, x: u32, y: u32) -> Result<Vec<u8>>;
+// groups features into one MVT layer per node_type; tags id + name + scalar properties
+```
+
+**Purpose:** turn `SpatialQuery` results into bytes a slippy-map renderer can
+draw; `TileActor::GetTile` composes this with the graph query and an LRU cache.
+**Notes:** built on the `mvt` crate (`prost` protobuf); geometry is clipped to
+the tile extent, so features spanning multiple tiles appear in each correctly.
 
 ## platform
 

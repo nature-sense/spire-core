@@ -4,6 +4,11 @@ use std::collections::HashMap;
 use thiserror::Error;
 use tokio::sync::oneshot;
 
+use crate::spatial::{
+    PROP_ALTITUDE, PROP_GEOMETRY, PROP_LATITUDE, PROP_LONGITUDE, PROP_MAX_LAT, PROP_MAX_LNG,
+    PROP_MIN_LAT, PROP_MIN_LNG,
+};
+
 // ============================================================================
 // Transaction Stream Types
 // ============================================================================
@@ -175,12 +180,104 @@ impl AttrNode {
 
     /// Typed accessor for a flattened numeric field.
     pub fn u32_prop(&self, key: &str) -> Option<u32> {
-        self.properties.get(key).and_then(|v| v.as_u64().map(|n| n as u32))
+        self.properties
+            .get(key)
+            .and_then(|v| v.as_u64().map(|n| n as u32))
     }
 
     /// Typed accessor for a flattened float field.
     pub fn f64_prop(&self, key: &str) -> Option<f64> {
         self.properties.get(key).and_then(|v| v.as_f64())
+    }
+
+    // ── Spatial accessors ──────────────────────────────────────────────
+    // WGS84 (EPSG:4326). `geo::Point::new(longitude, latitude)` — x = lng.
+
+    /// The node's point coordinates as stored on `latitude` / `longitude`.
+    pub fn geo_point(&self) -> Option<geo::Point<f64>> {
+        let latitude = self.f64_prop(PROP_LATITUDE)?;
+        let longitude = self.f64_prop(PROP_LONGITUDE)?;
+        Some(geo::Point::new(longitude, latitude))
+    }
+
+    /// The node's bounding box as stored on `min_lng`/`min_lat`/`max_lng`/`max_lat`.
+    pub fn geo_bounds(&self) -> Option<geo::Rect<f64>> {
+        let min_lng = self.f64_prop(PROP_MIN_LNG)?;
+        let min_lat = self.f64_prop(PROP_MIN_LAT)?;
+        let max_lng = self.f64_prop(PROP_MAX_LNG)?;
+        let max_lat = self.f64_prop(PROP_MAX_LAT)?;
+        Some(geo::Rect::new(
+            geo::Coord {
+                x: min_lng,
+                y: min_lat,
+            },
+            geo::Coord {
+                x: max_lng,
+                y: max_lat,
+            },
+        ))
+    }
+
+    /// The node's optional full geometry, read back from the GeoJSON-serialized
+    /// `geometry` property (see [`AttrNode::set_spatial_geometry`]).
+    pub fn spatial_geometry(&self) -> Option<geo::Geometry<f64>> {
+        let value = self.properties.get(PROP_GEOMETRY)?;
+        match value {
+            serde_json::Value::String(s) => serde_json::from_str::<geo::Geometry<f64>>(s).ok(),
+            v => serde_json::from_value::<geo::Geometry<f64>>(v.clone()).ok(),
+        }
+    }
+
+    /// Store a point on the node. Writes the `latitude` / `longitude` scalar
+    /// columns plus the degenerate bounding box columns.
+    pub fn set_geo_point(&mut self, point: geo::Point<f64>) {
+        let (lng, lat) = (point.x(), point.y());
+        let insert = |props: &mut HashMap<String, serde_json::Value>, key: &str, val: f64| {
+            props.insert(key.to_string(), serde_json::Value::from(val));
+        };
+        for (key, val) in [
+            (PROP_LONGITUDE, lng),
+            (PROP_MIN_LNG, lng),
+            (PROP_MAX_LNG, lng),
+            (PROP_LATITUDE, lat),
+            (PROP_MIN_LAT, lat),
+            (PROP_MAX_LAT, lat),
+        ] {
+            insert(&mut self.properties, key, val);
+        }
+    }
+
+    /// Store an arbitrary geometry (point, polygon, multi-polygon, …) on the
+    /// node. Serializes it as GeoJSON under the `geometry` property and
+    /// derives the scalar bounding-box columns so GQL range pre-filters find
+    /// the node. Point geometries also populate `latitude` / `longitude`.
+    pub fn set_spatial_geometry(&mut self, geometry: &geo::Geometry<f64>) {
+        let Ok(value) = serde_json::to_value(geometry) else {
+            return;
+        };
+        self.properties
+            .insert(PROP_GEOMETRY.to_string(), value.clone());
+        if let Some(rect) = crate::spatial::geometry_bounds(geometry) {
+            let insert = |props: &mut HashMap<String, serde_json::Value>, key: &str, val: f64| {
+                props.insert(key.to_string(), serde_json::Value::from(val));
+            };
+            for (key, val) in [
+                (PROP_MIN_LNG, rect.min().x),
+                (PROP_MAX_LNG, rect.max().x),
+                (PROP_MIN_LAT, rect.min().y),
+                (PROP_MAX_LAT, rect.max().y),
+            ] {
+                insert(&mut self.properties, key, val);
+            }
+        }
+        if let geo::Geometry::Point(p) = geometry {
+            self.set_geo_point(*p);
+        }
+    }
+
+    /// The node's optional altitude in meters (property `altitude`).
+    pub fn altitude(&self) -> Option<f64> {
+        self.f64_prop(PROP_ALTITUDE)
     }
 
     /// Typed accessor for a flattened boolean field.
@@ -424,6 +521,57 @@ pub enum RetrievalSource {
     Structural,
     Ambient,
     Hybrid,
+    /// Results produced by a spatial predicate (see [`SpatialQuery`]).
+    Spatial,
+}
+
+// ============================================================================
+// Spatial Query Types
+// ============================================================================
+
+/// A spatial predicate over graph nodes.
+///
+/// Coordinates follow the WGS84 (EPSG:4326) longitude/latitude convention
+/// (GeoJSON RFC 7946): `geo::Point::new(longitude, latitude)` — `x` is the
+/// longitude, `y` the latitude. Geodesic distances are in meters.
+///
+/// Which nodes are candidates is decided by the spatial property columns the
+/// node carries (`min_lng`/`min_lat`/`max_lng`/`max_lat` bounding box, or
+/// `latitude`/`longitude` for a point) — see the `AttrNode` helpers
+/// [`AttrNode::set_geo_point`] and [`AttrNode::set_spatial_geometry`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SpatialQuery {
+    /// All nodes whose bounding box lies inside `rect`.
+    BoundingBox { rect: geo::Rect<f64> },
+    /// The `k` nodes nearest to `center`, ordered by geodesic distance.
+    Nearest { center: geo::Point<f64>, k: usize },
+    /// All nodes whose geometry lies within `radius_meters` of `center`
+    /// (a node whose geometry contains the center is always within range).
+    Radius {
+        center: geo::Point<f64>,
+        radius_meters: f64,
+    },
+    /// All nodes whose geometry fully contains `geometry` (e.g. polygon
+    /// features containing a point of interest).
+    Contains { geometry: geo::Geometry<f64> },
+    /// All nodes whose geometry shares any point with `geometry`.
+    Intersects { geometry: geo::Geometry<f64> },
+}
+
+/// A single node hit returned by a spatial query. `distance_meters` is set for
+/// `Radius` / `Nearest` queries and `None` for the predicate queries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DistanceScoredNode {
+    pub node: AttrNode,
+    pub distance_meters: Option<f64>,
+}
+
+/// The result of a [`SpatialQuery`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpatialQueryResult {
+    pub nodes: Vec<DistanceScoredNode>,
+    pub total_results: usize,
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

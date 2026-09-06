@@ -245,7 +245,6 @@ impl Default for SearchModule {
 impl Actor for SearchModule {
     type Message = SearchMessage;
 
-
     async fn handle(&mut self, msg: Self::Message) {
         match msg {
             SearchMessage::SearchFiles {

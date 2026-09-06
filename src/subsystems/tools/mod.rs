@@ -13,14 +13,14 @@ pub use tool_orchestrator::{ToolOrchestrator, ToolOrchestratorMessage};
 
 use tokio::sync::mpsc;
 
-use crate::subsystems::llm::llm::LlmMessage;
-use crate::subsystems::mcp::mcp_client::McpClientMessage;
-use crate::subsystems::graph::memory_graph::MemoryGraphMessage;
 use crate::actors::tool_providers::ToolRouterMessage;
 use crate::actors::Actor;
+use crate::subsystems::graph::memory_graph::MemoryGraphMessage;
+use crate::subsystems::llm::llm::LlmMessage;
+use crate::subsystems::mcp::mcp_client::McpClientMessage;
+use crate::transport::socket::TransportMessage;
 use spire_actor::registry::ServiceRegistry;
 use spire_actor::subsystem::Subsystem;
-use crate::transport::socket::TransportMessage;
 
 /// Handles for the tools subsystem.
 pub struct ToolsHandles {

@@ -17,6 +17,7 @@ pub mod prompt_handler;
 pub mod rag;
 pub mod rag_ingest;
 pub mod system_prompt;
+pub mod tile;
 pub mod tool_providers;
 pub mod tools;
 pub mod web_search;
@@ -44,6 +45,7 @@ pub use progress::{ProgressActor, ProgressMessage, ProgressStatus, ProgressUpdat
 pub use prompt_handler::{PromptContext, PromptHandlerActor, PromptHandlerMessage};
 pub use rag::{RagActor, RagMessage};
 pub use system_prompt::{SystemPromptActor, SystemPromptMessage};
+pub use tile::{TileActor, TileFilters, TileMessage};
 pub use tool_providers::{ToolRouterActor, ToolRouterMessage};
 pub use tools::{ToolsActor, ToolsMessage};
 

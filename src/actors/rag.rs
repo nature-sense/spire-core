@@ -13,17 +13,17 @@
 //! (see [`crate::actors::rag_ingest`]) — the legacy `RagManifest` /
 //! `RagSourceConfig` shapes are retired.
 
-use anyhow::Result;
-use async_trait::async_trait;
-use std::path::{Path, PathBuf};
-use tokio::sync::{mpsc, oneshot};
-use crate::subsystems::graph::memory_graph::MemoryGraphMessage;
+use crate::actors::rag_ingest::{self, GraphRagConfig, IngestReport};
 use crate::actors::Actor;
 use crate::config::knowledge_dir;
-use crate::models::embedding::Embedder;
-use spire_actor::registry::ServiceRegistry;
 use crate::embedder::NoopEmbedder;
-use crate::actors::rag_ingest::{self, IngestReport, GraphRagConfig};
+use crate::models::embedding::Embedder;
+use crate::subsystems::graph::memory_graph::MemoryGraphMessage;
+use anyhow::Result;
+use async_trait::async_trait;
+use spire_actor::registry::ServiceRegistry;
+use std::path::{Path, PathBuf};
+use tokio::sync::{mpsc, oneshot};
 
 // ============================================================================
 // RAG types
@@ -193,7 +193,15 @@ impl RagActor {
 
     /// Semantic query over a domain's `rag_chunk` nodes, cosine-first.
     async fn query(&self, domain: &str, query: &str, top_k: usize) -> Result<Vec<RagChunkResult>> {
-        semantic_retrieve(&self.knowledge_tx, &self.embedder, domain, query, None, top_k).await
+        semantic_retrieve(
+            &self.knowledge_tx,
+            &self.embedder,
+            domain,
+            query,
+            None,
+            top_k,
+        )
+        .await
     }
 
     /// Count graph nodes/edges of a subtype, filtered by a domain property.
@@ -352,10 +360,26 @@ impl RagActor {
                 continue;
             }
             out.push(rag_ingest::SourceStatus {
-                id: n.get("source_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                source_type: n.get("source_type").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                status: n.get("status").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
-                reason: n.get("reason").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                id: n
+                    .get("source_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                source_type: n
+                    .get("source_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                status: n
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string(),
+                reason: n
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
                 chunks: n.get("chunks").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
                 files: n.get("files").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
             });
@@ -456,7 +480,11 @@ async fn semantic_retrieve(
             });
         }
     }
-    scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     scored.truncate(top_k.max(1));
     Ok(scored)
 }
@@ -508,7 +536,15 @@ async fn find_interfaces(
     query: &str,
     top_k: usize,
 ) -> Result<Vec<RagChunkResult>> {
-    semantic_retrieve(memory_graph_tx, embedder, domain, query, Some("code"), top_k).await
+    semantic_retrieve(
+        memory_graph_tx,
+        embedder,
+        domain,
+        query,
+        Some("code"),
+        top_k,
+    )
+    .await
 }
 
 /// Discover the available ingestion "scripts": every

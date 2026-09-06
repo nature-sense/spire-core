@@ -16,11 +16,11 @@ use std::collections::HashMap;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::subsystems::llm::llm::LlmMessage;
-use crate::subsystems::mcp::mcp_client::McpClientMessage;
-use crate::subsystems::graph::memory_graph::MemoryGraphMessage;
 use crate::actors::Actor;
 use crate::models::memory_graph::BuildError;
+use crate::subsystems::graph::memory_graph::MemoryGraphMessage;
+use crate::subsystems::llm::llm::LlmMessage;
+use crate::subsystems::mcp::mcp_client::McpClientMessage;
 use crate::transport::socket::TransportMessage;
 
 // ============================================================================
@@ -298,8 +298,9 @@ impl ToolOrchestrator {
                     .is_ok()
                 {
                     if let Ok(Ok(result)) = rx.await {
-                        return Ok(serde_json::to_string(&result)
-                            .unwrap_or_else(|_| result.to_string()));
+                        return Ok(
+                            serde_json::to_string(&result).unwrap_or_else(|_| result.to_string())
+                        );
                     }
                 }
                 warn!(
@@ -685,8 +686,7 @@ impl ToolOrchestrator {
             .is_ok()
         {
             if let Ok(Ok(result)) = rx.await {
-                return Ok(serde_json::to_string(&result)
-                    .unwrap_or_else(|_| result.to_string()));
+                return Ok(serde_json::to_string(&result).unwrap_or_else(|_| result.to_string()));
             }
         }
 

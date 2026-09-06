@@ -721,8 +721,7 @@ impl ClientHandlerCore for SimpleClientHandler {
         // so the SDK doesn't fabricate a secondary error on top of it.
         warn!(
             "MCP server returned error (code={}, message={}) — continuing",
-            error.code,
-            error.message
+            error.code, error.message
         );
         Ok(())
     }

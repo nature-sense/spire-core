@@ -20,7 +20,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,19 +33,18 @@ use selene_db_core::vector::VectorMetric;
 
 use spire_actor::Actor;
 
-use crate::models::embedding::Embedder;
 use crate::graph::GraphDb;
+use crate::models::embedding::Embedder;
 
 /// Canonical cross-compilation platform definitions cross the crate boundary
 /// as generic JSON (`{ "id", "name", "properties": {flat map} }`); spire-core
 /// owns the typed `Platform` YAML schema + view.
 use crate::models::memory_graph::{
-    AttrNode, ContextSearchResult, GraphEdge, McpConfigFile, McpServerConfigEntry,
-    MemoryEntry, MemoryMetadata, NodeUpdate, ProjectSnapshot,
-    ProjectStats, RelationshipInput, RelationshipType, RetrievalSource, ScoredNode, SearchOptions,
-    StreamOp,
-    StreamOpResult, TransactionRequest, TraversalDirection, TraversalOptions, TraversalPath,
-    TraversalResult,
+    AttrNode, ContextSearchResult, DistanceScoredNode, GraphEdge, McpConfigFile,
+    McpServerConfigEntry, MemoryEntry, MemoryMetadata, NodeUpdate, ProjectSnapshot, ProjectStats,
+    RelationshipInput, RelationshipType, RetrievalSource, ScoredNode, SearchOptions, SpatialQuery,
+    SpatialQueryResult, StreamOp, StreamOpResult, TransactionRequest, TraversalDirection,
+    TraversalOptions, TraversalPath, TraversalResult,
 };
 
 // ============================================================================
@@ -203,6 +202,19 @@ pub enum MemoryGraphMessage {
         query: String,
         limit: Option<usize>,
         reply_to: tokio::sync::oneshot::Sender<Result<Vec<MemoryEntry>>>,
+    },
+
+    // ── Spatial Queries ─────────────────────────────────
+    /// Run a spatial predicate over nodes that carry spatial properties
+    /// (`latitude`/`longitude` points, or `min_lng`/`min_lat`/`max_lng`/
+    /// `max_lat` bounding boxes with optional `geometry`). See
+    /// `crate::spatial` for the coordinate convention.
+    SpatialQuery {
+        query: SpatialQuery,
+        node_type: Option<String>,
+        subtype: Option<String>,
+        limit: Option<usize>,
+        reply_to: tokio::sync::oneshot::Sender<Result<SpatialQueryResult>>,
     },
 
     // ── Config Storage ───────────────────────────────────
@@ -541,7 +553,10 @@ impl MemoryGraphActor {
     /// Build a `GraphEdge` from an edge's resolved property list + endpoint
     /// UUIDs. Used by `parse_edge_from_row` and `edge_from_id` (traversal).
     fn graph_edge_from_props(
-        props: &[(selene_db_core::db_string::DbString, selene_db_core::value::Value)],
+        props: &[(
+            selene_db_core::db_string::DbString,
+            selene_db_core::value::Value,
+        )],
         from_uuid: String,
         to_uuid: String,
     ) -> Option<GraphEdge> {
@@ -748,11 +763,7 @@ impl MemoryGraphActor {
     /// `node_type` string is written verbatim (no enum mapping), scalar
     /// properties inline, complex (array/object) properties SET individually.
     /// `embedding` is stored as the node's vector.
-    fn store_attr_node_via_gql(
-        &self,
-        attr: &AttrNode,
-        embedding: Option<&[f32]>,
-    ) -> Result<()> {
+    fn store_attr_node_via_gql(&self, attr: &AttrNode, embedding: Option<&[f32]>) -> Result<()> {
         let graph_db = self
             .graph_db
             .as_ref()
@@ -1022,9 +1033,7 @@ impl MemoryGraphActor {
             format!(" WHERE {}", conditions.join(" AND "))
         };
 
-        let limit_clause = limit
-            .map(|l| format!(" LIMIT {}", l))
-            .unwrap_or_default();
+        let limit_clause = limit.map(|l| format!(" LIMIT {}", l)).unwrap_or_default();
 
         let gql = format!(
             "MATCH (n:{}){} RETURN n{}",
@@ -1170,8 +1179,6 @@ impl MemoryGraphActor {
             paths,
         })
     }
-
-
 
     /// Find a node by (node_type, name) within an existing transaction.
     /// Schedule a debounced snapshot write.
@@ -1350,9 +1357,7 @@ impl MemoryGraphActor {
 
         let embedding = embedder.embed(&text).await?;
 
-        let _mem_type_str = metadata
-            .as_ref()
-            .and_then(|m| m.mem_type.as_ref());
+        let _mem_type_str = metadata.as_ref().and_then(|m| m.mem_type.as_ref());
         let attr = AttrNode {
             id: memory_id.clone(),
             node_type: "Memory".to_string(),
@@ -1439,6 +1444,315 @@ impl MemoryGraphActor {
         }
 
         Ok(entries)
+    }
+
+    // ─── Spatial Queries ─────────────────────────────────────────────────
+
+    /// Run a single spatial query and return the matching nodes.
+    ///
+    /// All variants pre-filter with a GQL bounding-box range scan over the
+    /// scalar spatial columns, then refine with the exact predicates in
+    /// `crate::spatial`. See [`SpatialQuery`] for the semantics of each
+    /// variant and the `AttrNode` spatial helpers for how nodes carry
+    /// location data.
+    fn run_spatial_query(
+        &self,
+        query: &SpatialQuery,
+        node_type: Option<&str>,
+        subtype: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<SpatialQueryResult> {
+        self.graph_db
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("GraphDb not initialized"))?;
+
+        match query {
+            SpatialQuery::BoundingBox { rect } => {
+                self.spatial_bounding_box(rect, node_type, subtype, limit)
+            }
+            SpatialQuery::Radius {
+                center,
+                radius_meters,
+            } => self.spatial_radius(center, *radius_meters, node_type, subtype, limit),
+            SpatialQuery::Nearest { center, k } => {
+                self.spatial_nearest(center, *k, node_type, subtype)
+            }
+            SpatialQuery::Contains { geometry } => {
+                self.spatial_contains(geometry, node_type, subtype, limit)
+            }
+            SpatialQuery::Intersects { geometry } => {
+                self.spatial_intersects(geometry, node_type, subtype, limit)
+            }
+        }
+    }
+
+    /// Extra `WHERE` clauses restricting candidates by node type / subtype.
+    fn spatial_type_filter(node_type: Option<&str>, subtype: Option<&str>) -> String {
+        let mut filter = String::new();
+        if let Some(nt) = node_type {
+            filter.push_str(&format!(
+                " AND n.{} = '{}'",
+                PROP_NODE_TYPE,
+                Self::gql_escape(nt)
+            ));
+        }
+        if let Some(st) = subtype {
+            filter.push_str(&format!(
+                " AND n.{} = '{}'",
+                PROP_SUBTYPE,
+                Self::gql_escape(st)
+            ));
+        }
+        filter
+    }
+
+    /// Fetch every node whose stored spatial footprint (the bounding-box
+    /// columns, or plain `latitude`/`longitude` columns) intersects `window`.
+    ///
+    /// This is deliberately a *superset* pre-filter; the callers apply the
+    /// exact spatial predicate afterwards. Two GQL range queries are used (one
+    /// per storage layout) and merged/deduped by UUID.
+    fn spatial_candidates_in_window(
+        &self,
+        window: &geo::Rect<f64>,
+        node_type: Option<&str>,
+        subtype: Option<&str>,
+    ) -> Vec<AttrNode> {
+        let graph_db = match self.graph_db.as_ref() {
+            Some(db) => db,
+            None => return Vec::new(),
+        };
+        let (min_lng, min_lat) = (window.min().x, window.min().y);
+        let (max_lng, max_lat) = (window.max().x, window.max().y);
+        let filter = Self::spatial_type_filter(node_type, subtype);
+
+        // Nodes carrying the pre-computed bounding-box columns.
+        let bbox_cond = format!(
+            "n.{p_min_lng} <= {max_lng} AND n.{p_max_lng} >= {min_lng} \
+             AND n.{p_min_lat} <= {max_lat} AND n.{p_max_lat} >= {min_lat}{filter}",
+            p_min_lng = crate::spatial::PROP_MIN_LNG,
+            p_max_lng = crate::spatial::PROP_MAX_LNG,
+            p_min_lat = crate::spatial::PROP_MIN_LAT,
+            p_max_lat = crate::spatial::PROP_MAX_LAT,
+        );
+        // Nodes carrying plain point columns (legacy layout).
+        let point_cond = format!(
+            "n.{p_lng} >= {min_lng} AND n.{p_lng} <= {max_lng} \
+             AND n.{p_lat} >= {min_lat} AND n.{p_lat} <= {max_lat}{filter}",
+            p_lng = crate::spatial::PROP_LONGITUDE,
+            p_lat = crate::spatial::PROP_LATITUDE,
+        );
+
+        let mut out: Vec<AttrNode> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for cond in [bbox_cond, point_cond] {
+            let gql = format!("MATCH (n:{}) WHERE {} RETURN n", LABEL_SPIRE_NODE, cond);
+            if let Ok(table) = graph_db.execute_gql_query(&gql) {
+                for row in table.rows() {
+                    if let Some(attr) = Self::attr_node_from_ref_row(row, &table, graph_db) {
+                        if seen.insert(attr.id.clone()) {
+                            out.push(attr);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The best available geometry for a node: its stored `geometry`, else the
+    /// `latitude`/`longitude` point as a degenerate `Point` geometry.
+    fn node_geometry(attr: &AttrNode) -> Option<geo::Geometry<f64>> {
+        if let Some(g) = attr.spatial_geometry() {
+            return Some(g);
+        }
+        attr.geo_point().map(geo::Geometry::Point)
+    }
+
+    /// Great-circle distance from `center` to a node's geometry — `0` when the
+    /// geometry contains the center (e.g. a point inside a polygon zone).
+    fn spatial_distance_to(center: &geo::Point<f64>, attr: &AttrNode) -> f64 {
+        match Self::node_geometry(attr) {
+            Some(g) => crate::spatial::distance_point_to_geometry(center, &g),
+            None => f64::INFINITY,
+        }
+    }
+
+    /// Optionally sort by ascending distance, cap at `limit`, and report
+    /// whether the result was truncated.
+    fn spatial_result(
+        &self,
+        mut scored: Vec<DistanceScoredNode>,
+        limit: Option<usize>,
+        sort_by_distance: bool,
+    ) -> SpatialQueryResult {
+        if sort_by_distance {
+            scored.sort_by(|a, b| {
+                a.distance_meters
+                    .unwrap_or(f64::INFINITY)
+                    .partial_cmp(&b.distance_meters.unwrap_or(f64::INFINITY))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.node.id.cmp(&b.node.id))
+            });
+        }
+        let total_results = scored.len();
+        let truncated = limit.map(|l| l < scored.len()).unwrap_or(false);
+        if let Some(l) = limit {
+            scored.truncate(l);
+        }
+        SpatialQueryResult {
+            nodes: scored,
+            total_results,
+            truncated,
+        }
+    }
+
+    /// `BoundingBox`: nodes whose stored bounding box (a point's degenerate
+    /// box included) lies entirely inside `rect`.
+    fn spatial_bounding_box(
+        &self,
+        rect: &geo::Rect<f64>,
+        node_type: Option<&str>,
+        subtype: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<SpatialQueryResult> {
+        let candidates = self.spatial_candidates_in_window(rect, node_type, subtype);
+        let mut scored = Vec::new();
+        for attr in candidates {
+            let inside = match attr.geo_bounds() {
+                Some(bounds) => {
+                    rect.min().x <= bounds.min().x
+                        && bounds.max().x <= rect.max().x
+                        && rect.min().y <= bounds.min().y
+                        && bounds.max().y <= rect.max().y
+                }
+                None => attr
+                    .geo_point()
+                    .map(|p| crate::spatial::point_in_rect(&p, rect))
+                    .unwrap_or(false),
+            };
+            if inside {
+                scored.push(DistanceScoredNode {
+                    node: attr,
+                    distance_meters: None,
+                });
+            }
+        }
+        Ok(self.spatial_result(scored, limit, false))
+    }
+
+    /// `Radius`: nodes whose geometry is within `radius_meters` of `center`
+    /// (nodes whose geometry contains the center are at distance 0).
+    fn spatial_radius(
+        &self,
+        center: &geo::Point<f64>,
+        radius_meters: f64,
+        node_type: Option<&str>,
+        subtype: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<SpatialQueryResult> {
+        let window = crate::spatial::bounding_box_for_radius(center, radius_meters);
+        let candidates = self.spatial_candidates_in_window(&window, node_type, subtype);
+        let mut scored = Vec::new();
+        for attr in candidates {
+            let distance = Self::spatial_distance_to(center, &attr);
+            if distance <= radius_meters {
+                scored.push(DistanceScoredNode {
+                    node: attr,
+                    distance_meters: Some(distance),
+                });
+            }
+        }
+        Ok(self.spatial_result(scored, limit, true))
+    }
+
+    /// `Nearest`: the `k` nodes closest to `center`. The candidate window
+    /// doubles until it holds at least `k` candidates or spans the globe.
+    fn spatial_nearest(
+        &self,
+        center: &geo::Point<f64>,
+        k: usize,
+        node_type: Option<&str>,
+        subtype: Option<&str>,
+    ) -> Result<SpatialQueryResult> {
+        let k = k.max(1);
+        let mut radius_meters = 25_000.0;
+        let mut candidates: Vec<AttrNode> = Vec::new();
+        while radius_meters <= 20_000_000.0 {
+            let window = crate::spatial::bounding_box_for_radius(center, radius_meters);
+            candidates = self.spatial_candidates_in_window(&window, node_type, subtype);
+            if candidates.len() >= k {
+                break;
+            }
+            radius_meters *= 2.0;
+        }
+
+        let scored: Vec<DistanceScoredNode> = candidates
+            .into_iter()
+            .map(|attr| {
+                let distance = Self::spatial_distance_to(center, &attr);
+                DistanceScoredNode {
+                    node: attr,
+                    distance_meters: Some(distance),
+                }
+            })
+            .collect();
+        Ok(self.spatial_result(scored, Some(k), true))
+    }
+
+    /// `Contains`: nodes whose geometry fully contains the query geometry.
+    fn spatial_contains(
+        &self,
+        geometry: &geo::Geometry<f64>,
+        node_type: Option<&str>,
+        subtype: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<SpatialQueryResult> {
+        let window = crate::spatial::geometry_bounds(geometry)
+            .ok_or_else(|| anyhow::anyhow!("spatial query: query geometry has no bounds"))?;
+        let candidates = self.spatial_candidates_in_window(&window, node_type, subtype);
+        let mut scored = Vec::new();
+        for attr in candidates {
+            let node_geom = match Self::node_geometry(&attr) {
+                Some(g) => g,
+                None => continue,
+            };
+            if crate::spatial::geometry_contains(&node_geom, geometry) {
+                scored.push(DistanceScoredNode {
+                    node: attr,
+                    distance_meters: None,
+                });
+            }
+        }
+        Ok(self.spatial_result(scored, limit, false))
+    }
+
+    /// `Intersects`: nodes whose geometry shares any point with the query
+    /// geometry (overlap, touch, or containment either way).
+    fn spatial_intersects(
+        &self,
+        geometry: &geo::Geometry<f64>,
+        node_type: Option<&str>,
+        subtype: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<SpatialQueryResult> {
+        let window = crate::spatial::geometry_bounds(geometry)
+            .ok_or_else(|| anyhow::anyhow!("spatial query: query geometry has no bounds"))?;
+        let candidates = self.spatial_candidates_in_window(&window, node_type, subtype);
+        let mut scored = Vec::new();
+        for attr in candidates {
+            let node_geom = match Self::node_geometry(&attr) {
+                Some(g) => g,
+                None => continue,
+            };
+            if crate::spatial::geometries_intersect(&node_geom, geometry) {
+                scored.push(DistanceScoredNode {
+                    node: attr,
+                    distance_meters: None,
+                });
+            }
+        }
+        Ok(self.spatial_result(scored, limit, false))
     }
 
     fn store_node_in_txn(
@@ -1643,11 +1957,7 @@ impl MemoryGraphActor {
                 // Reuse the existing node's ID when present so relationships
                 // pointing at the old node stay valid (UPSERT semantics).
                 let subtype_cond = match &attr.subtype {
-                    Some(st) => format!(
-                        "AND n.{} = '{}'",
-                        PROP_SUBTYPE,
-                        Self::gql_escape(st)
-                    ),
+                    Some(st) => format!("AND n.{} = '{}'", PROP_SUBTYPE, Self::gql_escape(st)),
                     None => String::new(),
                 };
                 let find_gql = format!(
@@ -1662,9 +1972,11 @@ impl MemoryGraphActor {
                 let existing_uuid = match graph_db.execute_gql_query(&find_gql) {
                     Ok(table) => table.rows().first().and_then(|row| {
                         if let Some(n_idx) = table.column_index(crate::graph::to_db_string("n")) {
-                            if let Some(selene_db_core::value::Value::NodeRef(nid)) = row.get(n_idx) {
+                            if let Some(selene_db_core::value::Value::NodeRef(nid)) = row.get(n_idx)
+                            {
                                 if let Ok(props) = graph_db.resolve_node_properties(*nid) {
-                                    return Self::attr_node_from_resolved(&props).map(|a| a.id.clone());
+                                    return Self::attr_node_from_resolved(&props)
+                                        .map(|a| a.id.clone());
                                 }
                             }
                         }
@@ -1785,11 +2097,8 @@ impl Actor for MemoryGraphActor {
                     let table = graph_db.execute_gql_query(&gql)?;
                     let mut attr = None;
                     for row in table.rows() {
-                        if let Some(n_idx) =
-                            table.column_index(crate::graph::to_db_string("n"))
-                        {
-                            if let Some(selene_db_core::value::Value::NodeRef(nid)) =
-                                row.get(n_idx)
+                        if let Some(n_idx) = table.column_index(crate::graph::to_db_string("n")) {
+                            if let Some(selene_db_core::value::Value::NodeRef(nid)) = row.get(n_idx)
                             {
                                 if let Ok(props) = graph_db.resolve_node_properties(*nid) {
                                     attr = Self::attr_node_from_resolved(&props);
@@ -1823,11 +2132,7 @@ impl Actor for MemoryGraphActor {
                         ));
                     }
                     if let Some(st) = &subtype {
-                        conditions.push(format!(
-                            "n.{} = '{}'",
-                            PROP_SUBTYPE,
-                            Self::gql_escape(st)
-                        ));
+                        conditions.push(format!("n.{} = '{}'", PROP_SUBTYPE, Self::gql_escape(st)));
                     }
                     if let Some(nm) = &name {
                         conditions.push(format!("n.{} = '{}'", PROP_NAME, Self::gql_escape(nm)));
@@ -1837,9 +2142,7 @@ impl Actor for MemoryGraphActor {
                     } else {
                         format!(" WHERE {}", conditions.join(" AND "))
                     };
-                    let limit_clause = limit
-                        .map(|l| format!(" LIMIT {}", l))
-                        .unwrap_or_default();
+                    let limit_clause = limit.map(|l| format!(" LIMIT {}", l)).unwrap_or_default();
                     let gql = format!(
                         "MATCH (n:{}){} RETURN n{}",
                         LABEL_SPIRE_NODE, where_clause, limit_clause,
@@ -1848,8 +2151,7 @@ impl Actor for MemoryGraphActor {
                     let mut out = Vec::new();
                     for row in table.rows() {
                         if let Some(n_idx) = table.column_index(crate::graph::to_db_string("n")) {
-                            if let Some(selene_db_core::value::Value::NodeRef(nid)) =
-                                row.get(n_idx)
+                            if let Some(selene_db_core::value::Value::NodeRef(nid)) = row.get(n_idx)
                             {
                                 if let Ok(props) = graph_db.resolve_node_properties(*nid) {
                                     if let Some(attr) = Self::attr_node_from_resolved(&props) {
@@ -1872,11 +2174,7 @@ impl Actor for MemoryGraphActor {
                     // Reuse an existing UUID for the same (node_type, subtype,
                     // name) so upserts keep relationships pointing at the old node.
                     let subtype_cond = match &node.subtype {
-                        Some(st) => format!(
-                            "AND n.{} = '{}'",
-                            PROP_SUBTYPE,
-                            Self::gql_escape(st)
-                        ),
+                        Some(st) => format!("AND n.{} = '{}'", PROP_SUBTYPE, Self::gql_escape(st)),
                         None => String::new(),
                     };
                     let gql = format!(
@@ -1890,8 +2188,7 @@ impl Actor for MemoryGraphActor {
                     );
                     let existing_uuid = match graph_db.execute_gql_query(&gql) {
                         Ok(table) => table.rows().first().and_then(|row| {
-                            if let Some(n_idx) =
-                                table.column_index(crate::graph::to_db_string("n"))
+                            if let Some(n_idx) = table.column_index(crate::graph::to_db_string("n"))
                             {
                                 if let Some(selene_db_core::value::Value::NodeRef(nid)) =
                                     row.get(n_idx)
@@ -1959,11 +2256,12 @@ impl Actor for MemoryGraphActor {
                         .ok_or_else(|| anyhow::anyhow!("Target node not found: {}", rel.to_id))?;
 
                     if rel.edge_type == RelationshipType::DependsOn
-                        && self.would_create_cycle(&rel.from_id, &rel.to_id) {
-                            return Err(anyhow::anyhow!(
-                                "Adding this DependsOn edge would create a cycle"
-                            ));
-                        }
+                        && self.would_create_cycle(&rel.from_id, &rel.to_id)
+                    {
+                        return Err(anyhow::anyhow!(
+                            "Adding this DependsOn edge would create a cycle"
+                        ));
+                    }
 
                     let edge_uuid = Uuid::new_v4().to_string();
                     let now = Utc::now();
@@ -2128,6 +2426,17 @@ impl Actor for MemoryGraphActor {
                 reply_to,
             } => {
                 let result = self.handle_recall(query, limit).await;
+                let _ = reply_to.send(result);
+            }
+            MemoryGraphMessage::SpatialQuery {
+                query,
+                node_type,
+                subtype,
+                limit,
+                reply_to,
+            } => {
+                let result =
+                    self.run_spatial_query(&query, node_type.as_deref(), subtype.as_deref(), limit);
                 let _ = reply_to.send(result);
             }
             MemoryGraphMessage::SetConfig {
@@ -2329,7 +2638,8 @@ impl Actor for MemoryGraphActor {
                     self.schedule_snapshot();
                     info!(
                         "BootstrapPlatforms: stored {} platform definitions",
-                        self.query_attr_nodes(Some("Platform"), None, None, None).len()
+                        self.query_attr_nodes(Some("Platform"), None, None, None)
+                            .len()
                     );
                     Ok(())
                 })();
@@ -2338,7 +2648,10 @@ impl Actor for MemoryGraphActor {
             MemoryGraphMessage::GetPlatforms { reply_to } => {
                 let result = (|| -> Result<Vec<serde_json::Value>> {
                     let nodes = self.query_attr_nodes(Some("Platform"), None, None, None);
-                    Ok(nodes.iter().filter_map(Self::platform_node_to_json).collect())
+                    Ok(nodes
+                        .iter()
+                        .filter_map(Self::platform_node_to_json)
+                        .collect())
                 })();
                 let _ = reply_to.send(result);
             }

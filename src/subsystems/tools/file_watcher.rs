@@ -251,7 +251,11 @@ impl FileWatcherActor {
                 batch_id,
                 timestamp: Utc::now(),
             };
-            if output.send(FileChangeNotification::Batch { batch }).await.is_err() {
+            if output
+                .send(FileChangeNotification::Batch { batch })
+                .await
+                .is_err()
+            {
                 // Consumer gone — stop.
                 return;
             }
@@ -356,12 +360,16 @@ mod tests {
                 ..
             } => {
                 assert!(
-                    files.iter().any(|f| f.relative_path.ends_with("Cargo.toml")),
+                    files
+                        .iter()
+                        .any(|f| f.relative_path.ends_with("Cargo.toml")),
                     "expected Cargo.toml in scan, got: {:?}",
                     files.iter().map(|f| &f.relative_path).collect::<Vec<_>>()
                 );
                 assert!(
-                    files.iter().any(|f| f.relative_path.ends_with("src/main.rs")),
+                    files
+                        .iter()
+                        .any(|f| f.relative_path.ends_with("src/main.rs")),
                     "expected src/main.rs in scan"
                 );
                 assert!(
@@ -386,9 +394,7 @@ mod tests {
         // Root meson.build — the ONLY project() in the tree.
         std::fs::File::create(project.join("meson.build"))
             .unwrap()
-            .write_all(
-                b"project('ai-traps', ['c', 'cpp'])\nsubdir('rpi5')\n",
-            )
+            .write_all(b"project('ai-traps', ['c', 'cpp'])\nsubdir('rpi5')\n")
             .unwrap();
 
         // Platform subdir meson.build — NO project() call, but the comment
@@ -437,9 +443,7 @@ mod tests {
 
         // macOS resolves /var → /private/var in notify paths; canonicalize to
         // compare robustly.
-        let canonical_target = target
-            .canonicalize()
-            .unwrap_or_else(|_| target.clone());
+        let canonical_target = target.canonicalize().unwrap_or_else(|_| target.clone());
 
         match notification {
             FileChangeNotification::Batch { batch } => {

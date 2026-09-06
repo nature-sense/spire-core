@@ -74,9 +74,8 @@ pub fn tool_definitions() -> Vec<crate::actors::ToolInfo> {
         },
         crate::actors::ToolInfo {
             name: "search/wikipedia_extract".to_string(),
-            description:
-                "Get the full plain-text body of a Wikipedia article by exact title."
-                    .to_string(),
+            description: "Get the full plain-text body of a Wikipedia article by exact title."
+                .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -180,15 +179,24 @@ pub async fn wikipedia_search(query: &str, limit: usize) -> Result<Value, String
     let results: Vec<Value> = hits
         .iter()
         .map(|h| {
-            let title = h.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let title = h
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let snippet = regex::Regex::new("<[^>]*>")
                 .ok()
-                .map(|re| re.replace_all(h.get("snippet").and_then(|v| v.as_str()).unwrap_or(""), "").into_owned())
-                .unwrap_or_else(|| h.get("snippet").and_then(|v| v.as_str()).unwrap_or("").to_string());
-            let url = format!(
-                "https://en.wikipedia.org/wiki/{}",
-                title.replace(' ', "_")
-            );
+                .map(|re| {
+                    re.replace_all(h.get("snippet").and_then(|v| v.as_str()).unwrap_or(""), "")
+                        .into_owned()
+                })
+                .unwrap_or_else(|| {
+                    h.get("snippet")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string()
+                });
+            let url = format!("https://en.wikipedia.org/wiki/{}", title.replace(' ', "_"));
             json!({ "title": title, "url": url, "snippet": snippet })
         })
         .collect();
@@ -232,11 +240,10 @@ pub async fn wikipedia_extract(title: &str) -> Result<Value, String> {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let url = format!(
-        "https://en.wikipedia.org/wiki/{}",
-        title.replace(' ', "_")
-    );
-    Ok(json!({ "title": page.get("title").and_then(|v| v.as_str()).unwrap_or(title), "url": url, "content": content }))
+    let url = format!("https://en.wikipedia.org/wiki/{}", title.replace(' ', "_"));
+    Ok(
+        json!({ "title": page.get("title").and_then(|v| v.as_str()).unwrap_or(title), "url": url, "content": content }),
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -269,7 +276,9 @@ async fn tavily_search(api_key: &str, query: &str, max_results: usize) -> Result
         .json()
         .await
         .map_err(|e| format!("tavily search decode: {e}"))?;
-    Ok(json!({ "backend": "tavily", "answer": json.get("answer"), "results": json.get("results").cloned().unwrap_or_else(|| json!([])) }))
+    Ok(
+        json!({ "backend": "tavily", "answer": json.get("answer"), "results": json.get("results").cloned().unwrap_or_else(|| json!([])) }),
+    )
 }
 
 async fn tavily_extract(api_key: &str, urls: &[String]) -> Result<Value, String> {
@@ -328,7 +337,9 @@ async fn fetch_text(url: &str) -> Result<String, String> {
 }
 
 fn arg_str(args: &Value, key: &str) -> Option<String> {
-    args.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+    args.get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 fn arg_u64(args: &Value, key: &str) -> Option<u64> {
@@ -372,7 +383,10 @@ mod tests {
             })
             .collect();
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0]["url"], "https://en.wikipedia.org/wiki/Raspberry_Pi");
+        assert_eq!(
+            results[0]["url"],
+            "https://en.wikipedia.org/wiki/Raspberry_Pi"
+        );
         assert_eq!(results[0]["snippet"], "A single-board computer.");
     }
 
@@ -380,7 +394,9 @@ mod tests {
     fn tavily_key_absent_falls_back_to_wikipedia() {
         // We can't rely on the real ~/.spire config in tests; verify the
         // selection logic branches on presence rather than value shape.
-        assert!(get_global_llm_config_key("tavily.api_key").is_none()
-            || get_global_llm_config_key("tavily.api_key").is_some());
+        assert!(
+            get_global_llm_config_key("tavily.api_key").is_none()
+                || get_global_llm_config_key("tavily.api_key").is_some()
+        );
     }
 }

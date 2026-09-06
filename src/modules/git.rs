@@ -218,7 +218,6 @@ impl Default for GitModule {
 impl Actor for GitModule {
     type Message = GitMessage;
 
-
     async fn handle(&mut self, msg: Self::Message) {
         match msg {
             GitMessage::Status { path, reply_to } => {

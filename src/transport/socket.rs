@@ -348,9 +348,9 @@ impl Actor for TransportActor {
                                                 })
                                                 .await
                                                 .is_err()
-                                            {
-                                                break;
-                                            }
+                                        {
+                                            break;
+                                        }
                                     }
                                     Err(e) => {
                                         error!("TransportActor: error reading from socket: {}", e);
@@ -383,12 +383,7 @@ impl Actor for TransportActor {
 
                 let (response_tx, response_rx) = oneshot::channel();
 
-                self.pending.insert(
-                    id,
-                    PendingRequest {
-                        response_tx,
-                    },
-                );
+                self.pending.insert(id, PendingRequest { response_tx });
 
                 let request = serde_json::json!({
                     "jsonrpc": "2.0",

@@ -189,7 +189,144 @@ mg_tx
 println!("found {} nodes", r.await.unwrap().unwrap().len());
 ```
 
-## 7. Query a RAG corpus
+## 7. Spatial queries on the memory graph
+
+```rust
+// Continue from example 6's `mg_tx`. Nodes carry WGS84 location via AttrNode
+// helpers; axis order is `geo::Point::new(longitude, latitude)`.
+use spire_core::models::memory_graph::{AttrNode, SpatialQuery};
+use tokio::sync::oneshot;
+
+fn node(id: &str, name: &str, node_type: &str) -> AttrNode {
+    AttrNode {
+        id: id.to_string(),
+        node_type: node_type.to_string(),
+        subtype: None,
+        name: name.to_string(),
+        description: None,
+        properties: Default::default(),
+        embedding_id: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        version: 1,
+    }
+}
+
+// A point sensor …
+let mut sensor = node("s1", "sensor-nyc", "Sensor");
+sensor.set_geo_point(geo::Point::new(-74.006, 40.7128)); // (lng, lat)
+
+// … and a polygon "zone". set_spatial_geometry derives the bounding-box
+// columns that make GQL pre-filtering work.
+let mut zone = node("z1", "zone-nyc", "Zone");
+let ring: geo::LineString<f64> = vec![
+    (-74.5, 40.5), (-73.5, 40.5), (-73.5, 41.0), (-74.5, 41.0), (-74.5, 40.5),
+].into();
+zone.set_spatial_geometry(&geo::Geometry::Polygon(geo::Polygon::new(ring, Vec::new())));
+
+for n in [sensor, zone] {
+    let (t, r) = oneshot::channel();
+    mg_tx.send(MemoryGraphMessage::StoreAttrNode { node: n, reply_to: t }).await.unwrap();
+    r.await.unwrap().unwrap();
+}
+
+// Nodes inside a bounding box.
+let (t, r) = oneshot::channel();
+mg_tx
+    .send(MemoryGraphMessage::SpatialQuery {
+        query: SpatialQuery::BoundingBox {
+            rect: geo::Rect::new(
+                geo::Coord { x: -74.5, y: 40.5 },
+                geo::Coord { x: -73.5, y: 41.0 },
+            ),
+        },
+        node_type: None,
+        subtype: None,
+        limit: Some(50),
+        reply_to: t,
+    })
+    .await.unwrap();
+let hits = r.await.unwrap().unwrap();
+println!("{} nodes in the box", hits.nodes.len());
+
+// Everything within 100 km of the sensor (geodesic meters).
+let (t, r) = oneshot::channel();
+mg_tx
+    .send(MemoryGraphMessage::SpatialQuery {
+        query: SpatialQuery::Radius {
+            center: geo::Point::new(-74.006, 40.7128),
+            radius_meters: 100_000.0,
+        },
+        node_type: None,
+        subtype: None,
+        limit: None,
+        reply_to: t,
+    })
+    .await.unwrap();
+let hits = r.await.unwrap().unwrap();
+for hit in hits.nodes {
+    println!("{} within range at {:.0} m", hit.node.name, hit.distance_meters.unwrap_or(0.0));
+}
+
+// k nearest nodes, ordered by geodesic distance (meters).
+let (t, r) = oneshot::channel();
+mg_tx
+    .send(MemoryGraphMessage::SpatialQuery {
+        query: SpatialQuery::Nearest {
+            center: geo::Point::new(-74.006, 40.7128),
+            k: 3,
+        },
+        node_type: None,
+        subtype: None,
+        limit: None,
+        reply_to: t,
+    })
+    .await.unwrap();
+let hits = r.await.unwrap().unwrap();
+for hit in hits.nodes {
+    println!("{} — {:.0} m", hit.node.name, hit.distance_meters.unwrap_or(0.0));
+}
+
+// Features whose polygon geometry contains a point of interest.
+let (t, r) = oneshot::channel();
+mg_tx
+    .send(MemoryGraphMessage::SpatialQuery {
+        query: SpatialQuery::Contains {
+            geometry: geo::Geometry::Point(geo::Point::new(-73.99, 40.75)),
+        },
+        node_type: Some("Zone".to_string()),
+        subtype: None,
+        limit: None,
+        reply_to: t,
+    })
+    .await.unwrap();
+let hits = r.await.unwrap().unwrap();
+println!("{} zone(s) contain the point", hits.nodes.len());
+
+// Features overlapping a search polygon.
+let search: geo::LineString<f64> = vec![
+    (-74.0, 40.6), (-73.8, 40.6), (-73.8, 40.9), (-74.0, 40.9), (-74.0, 40.6),
+].into();
+let (t, r) = oneshot::channel();
+mg_tx
+    .send(MemoryGraphMessage::SpatialQuery {
+        query: SpatialQuery::Intersects {
+            geometry: geo::Geometry::Polygon(geo::Polygon::new(search, Vec::new())),
+        },
+        node_type: None,
+        subtype: None,
+        limit: None,
+        reply_to: t,
+    })
+    .await.unwrap();
+let hits = r.await.unwrap().unwrap();
+println!("{} feature(s) overlap the search area", hits.nodes.len());
+```
+
+See [`docs/spatial.md`](spatial.md) for the storage model, semantics, and
+spatial + RAG composition patterns.
+
+## 8. Query a RAG corpus
 
 ```rust
 use std::sync::Arc;
@@ -218,7 +355,7 @@ match r.await.unwrap() {
 }
 ```
 
-## 8. Call a platform module
+## 9. Call a platform module
 
 Modules are plain `Actor`s (they own no sub-actors) — spawn them directly with
 `ActorSystem::spawn` and keep the sender.
@@ -244,7 +381,7 @@ match r.await.unwrap() {
 }
 ```
 
-## 9. Global config
+## 10. Global config
 
 ```rust
 use spire_core::config;
@@ -260,4 +397,54 @@ println!("deepseek key set: {}", key.is_some());
 
 A full end-to-end ingestion example that exercises the real KnowledgeStore is in
 [`examples/rag_ingest_check.rs`](../examples/rag_ingest_check.rs).
+## 11. Vector tiles for the map UI
 
+```rust
+// Spawn a graph + TileActor, then request an MVT tile around Singapore.
+use spire_core::actors::{
+    Actor, ActorSystem, MemoryGraphActor, MemoryGraphMessage, TileActor, TileFilters,
+    TileMessage,
+};
+use tokio::sync::oneshot;
+
+let system = ActorSystem::new();
+let (mg_tx, _h) = system.spawn(MemoryGraphActor::new());
+// ... Initialize the graph, then store Sensor nodes with
+//     node.set_geo_point(geo::Point::new(lng, lat)) (examples 6 & 7).
+
+let (tile_tx, _th) = system.spawn(TileActor::new(mg_tx.clone()));
+
+// MVT bytes for the z10 tile (x=807, y=508) containing (103.85, 1.35).
+let (t, r) = oneshot::channel();
+tile_tx
+    .send(TileMessage::GetTile {
+        filters: TileFilters {
+            node_type: Some("Sensor".to_string()),
+            ..Default::default()
+        },
+        z: 10,
+        x: 807,
+        y: 508,
+        reply_to: t,
+    })
+    .await
+    .unwrap();
+let mvt: Vec<u8> = r.await.unwrap().unwrap();
+println!("encoded {} bytes of MVT", mvt.len());
+
+// GetTileFeatures returns the underlying nodes (e.g. for GeoJSON).
+let (t, r) = oneshot::channel();
+tile_tx
+    .send(TileMessage::GetTileFeatures {
+        filters: TileFilters::default(),
+        z: 10,
+        x: 807,
+        y: 508,
+        reply_to: t,
+    })
+    .await
+    .unwrap();
+println!("{} feature(s) in tile", r.await.unwrap().unwrap().len());
+```
+
+See [`docs/spatial.md`](spatial.md) for the tile pipeline and semantics.

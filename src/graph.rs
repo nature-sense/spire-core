@@ -519,7 +519,6 @@ impl GraphDb {
 
     /// Execute a GQL write statement via the GQL session.
     pub fn execute_gql_write(&self, gql: &str) -> Result<()> {
-        
         let mut session =
             selene_db_gql::Session::with_principal(&self.shared, b"spire-core".to_vec().into());
         let registry = selene_db_gql::EmptyProcedureRegistry;
@@ -531,7 +530,6 @@ impl GraphDb {
 
     /// Execute a GQL query and return the BindingTable result.
     pub fn execute_gql_query(&self, gql: &str) -> Result<selene_db_gql::runtime::BindingTable> {
-        
         let mut session =
             selene_db_gql::Session::with_principal(&self.shared, b"spire-core".to_vec().into());
         let registry = selene_db_gql::EmptyProcedureRegistry;

@@ -63,13 +63,17 @@ async fn doc_example_2_service_registry() {
     system.register("chat", chat_tx.clone()).unwrap();
 
     // Look it back up — type-checked via TypeId (wrong type ⇒ None).
-    let tx: mpsc::Sender<ChatMessage> =
-        system.registry().get("chat").expect("chat service");
+    let tx: mpsc::Sender<ChatMessage> = system.registry().get("chat").expect("chat service");
     assert!(!tx.is_closed(), "looked-up sender must be a live channel");
     // The looked-up sender is the same live channel: a message reaches the actor.
     let (rt, rr) = oneshot::channel();
-    tx.send(ChatMessage::GetActive { reply_to: rt }).await.unwrap();
-    assert!(rr.await.unwrap().is_some(), "default dialog should be active");
+    tx.send(ChatMessage::GetActive { reply_to: rt })
+        .await
+        .unwrap();
+    assert!(
+        rr.await.unwrap().is_some(),
+        "default dialog should be active"
+    );
 
     // A lookup with the wrong message type must return None.
     let wrong: Option<mpsc::Sender<MemoryGraphMessage>> = system.registry().get("chat");
@@ -166,7 +170,10 @@ async fn doc_example_4_child_actor_with_cached_service() {
     let (tx, rx) = oneshot::channel();
     probe_tx.send(ProbeMsg::GetActive(tx)).await.unwrap();
     let active = rx.await.unwrap();
-    assert!(active.is_some(), "ChatProbe should resolve the default active dialog");
+    assert!(
+        active.is_some(),
+        "ChatProbe should resolve the default active dialog"
+    );
 }
 
 // ============================================================================
@@ -178,7 +185,11 @@ async fn doc_example_5_build_file_tree() {
     // A small temp project keeps the test hermetic (the docs example passes ".").
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"demo\"\n",
+    )
+    .unwrap();
     // Enough bytes that the size/50 line heuristic yields > 0 estimated lines.
     std::fs::write(
         dir.path().join("src/main.rs"),
@@ -187,7 +198,10 @@ async fn doc_example_5_build_file_tree() {
     .unwrap();
 
     let tree = build_file_tree(dir.path(), /*no_ignore=*/ false);
-    assert!(tree.total_file_count >= 2, "expected src/main.rs + Cargo.toml");
+    assert!(
+        tree.total_file_count >= 2,
+        "expected src/main.rs + Cargo.toml"
+    );
     assert!(tree.directories.iter().any(|d| d.name == "src"));
     // The tree estimates lines from file sizes.
     assert!(tree.total_lines > 0);
@@ -295,7 +309,10 @@ async fn doc_example_7_query_rag_corpus() {
     // Degraded-mode contract: the no-op embedder never produces vectors, so a
     // query with it must resolve to an error rather than silently returning
     // empty or fake results.
-    assert!(reply.is_err(), "NoopEmbedder queries must fail loudly, got {reply:?}");
+    assert!(
+        reply.is_err(),
+        "NoopEmbedder queries must fail loudly, got {reply:?}"
+    );
     match &reply {
         Ok(chunks) => println!("doc_example_7: retrieval returned {} chunks", chunks.len()),
         Err(e) => println!("doc_example_7: retrieval failed without a real embedder: {e}"),
@@ -344,7 +361,10 @@ async fn doc_example_9_global_config() {
 
     // Persist a key (atomic temp-file + rename write).
     let result = spire_core::config::set_global_llm_config_key("deepseek.api_key", "sk-test");
-    assert!(result.is_ok(), "set_global_llm_config_key failed: {result:?}");
+    assert!(
+        result.is_ok(),
+        "set_global_llm_config_key failed: {result:?}"
+    );
 
     // Read it back through both accessors.
     let key = spire_core::config::get_global_llm_config_key("deepseek.api_key");
@@ -358,5 +378,3 @@ async fn doc_example_9_global_config() {
         None => std::env::remove_var("SPIRE_CONFIG_DIR"),
     }
 }
-
-

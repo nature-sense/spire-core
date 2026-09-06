@@ -113,3 +113,26 @@ project understanding.
 - Used by `spire-code`'s `ProjectAnalyzerActor` and by `FileWatcherActor`.
 
 Key modules: `analyzer::scanner`, `analyzer::tree_builder`.
+
+## 10. Spatial queries over geotagged nodes
+
+**Goal:** answer "what is near/inside/overlapping this place?" over nodes that
+carry WGS84 coordinates or geometries (sensor deployments, survey zones,
+monitoring sites).
+
+1. Tag nodes before storing: `AttrNode::set_geo_point(Point::new(lng, lat))` for
+   points or `AttrNode::set_spatial_geometry(&Geometry)` for polygons/lines —
+   both derive the scalar bounding-box columns used by the GQL pre-filter.
+2. `MemoryGraphMessage::SpatialQuery { query, node_type, subtype, limit }` with a
+   `SpatialQuery` variant:
+   - `BoundingBox { rect }` — nodes whose stored bounding box is inside `rect`.
+   - `Radius { center, radius_meters }` — nodes within N geodesic meters.
+   - `Nearest { center, k }` — the k closest nodes, distances in meters.
+   - `Contains { geometry }` / `Intersects { geometry }` — arbitrary geometry
+     predicates (point-in-zone, overlap, touching).
+3. Combine with semantic retrieval: geotagged `rag_chunk`-style nodes can be
+   pre-filtered by region and then cosine-ranked (or vice-versa) for
+   place-aware RAG.
+
+Key modules: `spatial` (functions), `AttrNode` spatial helpers, and the
+`SpatialQuery` message. See [`docs/spatial.md`](spatial.md).

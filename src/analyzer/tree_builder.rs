@@ -60,7 +60,8 @@ fn build_directory_node(
         // (`rpi/hal/rpi`).
         if prefix != "." {
             let inside = rel == prefix
-                || rel.strip_prefix(prefix)
+                || rel
+                    .strip_prefix(prefix)
                     .is_some_and(|rest| rest.starts_with('/') && !rest[1..].is_empty());
             if !inside {
                 continue;
@@ -258,9 +259,9 @@ fn classify_file_role(path: &str, language: &str) -> String {
             || path == "tsconfig.json"
             || path == ".gitignore"
             || path == "pnpm-workspace.yaml")
-        {
-            return "config".to_string();
-        }
+    {
+        return "config".to_string();
+    }
 
     // Documentation
     if path_lower.ends_with(".md") || path_lower.ends_with(".txt") || path_lower.ends_with(".rst") {

@@ -334,7 +334,11 @@ impl Actor for FilesystemModule {
             FilesystemMessage::Copy { from, to, reply_to } => {
                 let _ = reply_to.send(self.copy_path(&from, &to));
             }
-            FilesystemMessage::ApplyPatch { path, patch, reply_to } => {
+            FilesystemMessage::ApplyPatch {
+                path,
+                patch,
+                reply_to,
+            } => {
                 let _ = reply_to.send(apply_unified_patch(&path, &patch));
             }
             FilesystemMessage::CallTool {
@@ -413,9 +417,7 @@ pub fn apply_unified_patch(file_path: &Path, patch: &str) -> serde_json::Value {
             let line = patch_lines[i];
             i += 1;
             if let Some(ctx) = line.strip_prefix(' ') {
-                if cursor >= 0
-                    && (cursor as usize) < lines.len()
-                    && lines[cursor as usize] == *ctx
+                if cursor >= 0 && (cursor as usize) < lines.len() && lines[cursor as usize] == *ctx
                 {
                     new_lines.push(ctx.to_string());
                     cursor += 1;
@@ -423,9 +425,7 @@ pub fn apply_unified_patch(file_path: &Path, patch: &str) -> serde_json::Value {
                     return serde_json::json!({ "ok": false, "error": "context mismatch" });
                 }
             } else if let Some(del) = line.strip_prefix('-') {
-                if cursor >= 0
-                    && (cursor as usize) < lines.len()
-                    && lines[cursor as usize] == *del
+                if cursor >= 0 && (cursor as usize) < lines.len() && lines[cursor as usize] == *del
                 {
                     cursor += 1;
                 } else {
@@ -485,7 +485,9 @@ mod tests {
         let module = FilesystemModule::new();
         let dir = std::env::temp_dir().join(format!("spire-patch-{}", std::process::id()));
         let path = dir.join("main.rs");
-        module.write_file(&path, "fn main() {\n    old();\n}\n").unwrap();
+        module
+            .write_file(&path, "fn main() {\n    old();\n}\n")
+            .unwrap();
 
         let patch = "@@ -1,3 +1,3 @@\n fn main() {\n-    old();\n+    new();\n }\n";
         let res = apply_unified_patch(&path, patch);
@@ -502,7 +504,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("spire-patch-reject-{}", std::process::id()));
         let path = dir.join("main.rs");
         // Note: the file does NOT contain the expected context line.
-        module.write_file(&path, "fn main() {\n    different();\n}\n").unwrap();
+        module
+            .write_file(&path, "fn main() {\n    different();\n}\n")
+            .unwrap();
 
         let patch = "@@ -1,3 +1,3 @@\n fn main() {\n-    old();\n+    new();\n }\n";
         let res = apply_unified_patch(&path, patch);

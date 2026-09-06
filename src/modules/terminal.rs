@@ -179,7 +179,6 @@ impl Default for TerminalModule {
 impl Actor for TerminalModule {
     type Message = TerminalMessage;
 
-
     async fn handle(&mut self, msg: Self::Message) {
         match msg {
             TerminalMessage::Execute {

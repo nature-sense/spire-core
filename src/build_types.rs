@@ -221,7 +221,6 @@ impl ProjectStructure {
     }
 }
 
-
 /// Diagnostic found while importing/analyzing a project. Non-fatal — analysis
 /// still succeeds, but surfaced to the user so structure problems (e.g. a HAL
 /// interface with no implementation for a platform) are visible.
@@ -541,7 +540,13 @@ mod tests {
             assert_eq!(ProjectStructure::from_str(key).as_str(), key);
         }
         assert_eq!(ProjectStructure::from_str(""), ProjectStructure::Native);
-        assert_eq!(ProjectStructure::from_str("bogus"), ProjectStructure::Native);
-        assert_eq!(ProjectStructure::from_str("SPIRE_APP"), ProjectStructure::Native);
+        assert_eq!(
+            ProjectStructure::from_str("bogus"),
+            ProjectStructure::Native
+        );
+        assert_eq!(
+            ProjectStructure::from_str("SPIRE_APP"),
+            ProjectStructure::Native
+        );
     }
 }

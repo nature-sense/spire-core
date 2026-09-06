@@ -907,7 +907,11 @@ impl Actor for LlmActor {
 
     async fn handle(&mut self, msg: Self::Message) {
         match msg {
-            LlmMessage::Complete { prompt, role, reply_to } => {
+            LlmMessage::Complete {
+                prompt,
+                role,
+                reply_to,
+            } => {
                 let result = self.complete(&prompt, role).await;
                 let _ = reply_to.send(result);
             }

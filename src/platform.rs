@@ -156,8 +156,18 @@ impl Platform {
             let _ = writeln!(s, "PKG_CONFIG_LIBDIR = \"{joined}\"");
         }
         let _ = writeln!(s, "CC_{} = \"{}\"", triple.to_uppercase(), self.toolchain.c);
-        let _ = writeln!(s, "CXX_{} = \"{}\"", triple.to_uppercase(), self.toolchain.cpp);
-        let _ = writeln!(s, "AR_{} = \"{}\"", triple.to_uppercase(), self.toolchain.ar);
+        let _ = writeln!(
+            s,
+            "CXX_{} = \"{}\"",
+            triple.to_uppercase(),
+            self.toolchain.cpp
+        );
+        let _ = writeln!(
+            s,
+            "AR_{} = \"{}\"",
+            triple.to_uppercase(),
+            self.toolchain.ar
+        );
         Some(s)
     }
 
@@ -173,11 +183,7 @@ impl Platform {
         let sysroot_arg = format!("--sysroot={}", sysroot);
 
         // Implicit target args: -target <triple> + --sysroot + optional march.
-        let mut target_args = vec![
-            "-target".to_string(),
-            triple.clone(),
-            sysroot_arg.clone(),
-        ];
+        let mut target_args = vec!["-target".to_string(), triple.clone(), sysroot_arg.clone()];
         if let Some(march) = &self.architecture.march {
             target_args.push(format!("-march={}", march));
         }
@@ -187,11 +193,7 @@ impl Platform {
         let mut cpp_args = target_args.clone();
         cpp_args.extend(self.substituted(&self.toolchain.cpp_args_extra));
 
-        let mut link_args = vec![
-            "-target".to_string(),
-            triple.clone(),
-            sysroot_arg.clone(),
-        ];
+        let mut link_args = vec!["-target".to_string(), triple.clone(), sysroot_arg.clone()];
         if let Some(ld) = &self.toolchain.ld {
             if ld.ends_with("lld") {
                 link_args.push("-fuse-ld=lld".to_string());
@@ -220,13 +222,19 @@ impl Platform {
         let mut s = String::new();
         s.push_str("[host_machine]\n");
         s.push_str(&format!("system = '{}'\n", self.os));
-        s.push_str(&format!("cpu_family = '{}'\n", self.architecture.cpu_family));
+        s.push_str(&format!(
+            "cpu_family = '{}'\n",
+            self.architecture.cpu_family
+        ));
         s.push_str(&format!("cpu = '{}'\n", self.architecture.cpu));
         s.push_str(&format!("endian = '{}'\n", self.architecture.endian));
         s.push('\n');
         s.push_str("[target_machine]\n");
         s.push_str(&format!("system = '{}'\n", self.os));
-        s.push_str(&format!("cpu_family = '{}'\n", self.architecture.cpu_family));
+        s.push_str(&format!(
+            "cpu_family = '{}'\n",
+            self.architecture.cpu_family
+        ));
         s.push_str(&format!("cpu = '{}'\n", self.architecture.cpu));
         s.push_str(&format!("endian = '{}'\n", self.architecture.endian));
         s.push('\n');
@@ -250,9 +258,15 @@ impl Platform {
         s.push('\n');
         s.push_str("[properties]\n");
         s.push_str(&format!("sys_root = '{}'\n", sysroot));
-        s.push_str(&format!("needs_exe_wrapper = {}\n", self.toolchain.needs_exe_wrapper));
+        s.push_str(&format!(
+            "needs_exe_wrapper = {}\n",
+            self.toolchain.needs_exe_wrapper
+        ));
         if !self.sysroot.lib_dirs.is_empty() {
-            s.push_str(&format!("lib_dirs = {}\n", fmt_list(&self.sysroot.lib_dirs)));
+            s.push_str(&format!(
+                "lib_dirs = {}\n",
+                fmt_list(&self.sysroot.lib_dirs)
+            ));
         }
         if !self.sysroot.pkg_config_libdir.is_empty() {
             s.push_str(&format!(
@@ -427,10 +441,18 @@ sysroot:
         let cross = p.meson_cross_file().expect("linux platform cross file");
 
         // Target args with -target + sysroot + march on c_args.
-        assert!(cross.contains("cpu_family = 'aarch64'"), "missing cpu_family");
+        assert!(
+            cross.contains("cpu_family = 'aarch64'"),
+            "missing cpu_family"
+        );
         assert!(cross.contains("system = 'linux'"), "missing os");
         assert!(cross.contains("-target"), "missing -target");
-        assert!(cross.contains("--sysroot=/Users/steve/naturesense/ai-traps/tools/native/sysroots/rock3c"), "missing sysroot");
+        assert!(
+            cross.contains(
+                "--sysroot=/Users/steve/naturesense/ai-traps/tools/native/sysroots/rock3c"
+            ),
+            "missing sysroot"
+        );
         assert!(cross.contains("-march=armv8.2-a+crc"), "missing march");
         assert!(cross.contains("-fuse-ld=lld"), "missing lld fuse");
         assert!(cross.contains("pkgconfig = '/Users/steve/naturesense/ai-traps/tools/native/sysroots/rock3c/bin/aarch64-pkg-config'"), "missing pkgconfig");
@@ -439,7 +461,12 @@ sysroot:
             cross.contains("-I/Users/steve/naturesense/ai-traps/tools/native/sysroots/rock3c/usr/include/c++/12"),
             "missing substituted cpp include"
         );
-        assert!(cross.contains("sys_root = '/Users/steve/naturesense/ai-traps/tools/native/sysroots/rock3c'"), "missing sys_root");
+        assert!(
+            cross.contains(
+                "sys_root = '/Users/steve/naturesense/ai-traps/tools/native/sysroots/rock3c'"
+            ),
+            "missing sys_root"
+        );
         assert!(
             cross.contains("pkg_config_libdir = ['/Users/steve/naturesense/ai-traps/tools/native/sysroots/rock3c/usr/lib/aarch64-linux-gnu/pkgconfig', '/Users/steve/naturesense/ai-traps/tools/native/sysroots/rock3c/usr/share/pkgconfig']"),
             "missing pkg_config_libdir"
@@ -479,14 +506,19 @@ sysroot:
         let p = Platform::load(tmp.path().join("rock3c.yaml")).unwrap();
         let cfg = p.cargo_config().expect("linux cargo config");
 
-        assert!(cfg.contains("[target.aarch64-linux-gnu]"), "missing target section");
+        assert!(
+            cfg.contains("[target.aarch64-linux-gnu]"),
+            "missing target section"
+        );
         assert!(cfg.contains("linker = \"clang\""), "missing linker");
         assert!(
             cfg.contains("link-arg=--target=aarch64-linux-gnu"),
             "missing target link-arg"
         );
         assert!(
-            cfg.contains("link-arg=--sysroot=/Users/steve/naturesense/ai-traps/tools/native/sysroots/rock3c"),
+            cfg.contains(
+                "link-arg=--sysroot=/Users/steve/naturesense/ai-traps/tools/native/sysroots/rock3c"
+            ),
             "missing sysroot link-arg"
         );
         assert!(
@@ -498,8 +530,14 @@ sysroot:
             "missing joined pkg-config libdir"
         );
         // Toolchain env vars use the UPPERCASED triple.
-        assert!(cfg.contains("CC_AARCH64-LINUX-GNU = \"clang\""), "missing CC env");
-        assert!(cfg.contains("CXX_AARCH64-LINUX-GNU = \"clang++\""), "missing CXX env");
+        assert!(
+            cfg.contains("CC_AARCH64-LINUX-GNU = \"clang\""),
+            "missing CC env"
+        );
+        assert!(
+            cfg.contains("CXX_AARCH64-LINUX-GNU = \"clang++\""),
+            "missing CXX env"
+        );
         assert!(
             cfg.contains("AR_AARCH64-LINUX-GNU = \"/opt/homebrew/opt/llvm/bin/llvm-ar\""),
             "missing AR env"
@@ -546,7 +584,11 @@ sysroot:
             },
             toolchain: PlatformToolchain::default(),
             sysroot: PlatformSysroot {
-                root: tmp.path().join("no-such-sysroot").to_string_lossy().to_string(),
+                root: tmp
+                    .path()
+                    .join("no-such-sysroot")
+                    .to_string_lossy()
+                    .to_string(),
                 lib_dirs: Vec::new(),
                 include_dirs: Vec::new(),
                 pkg_config_libdir: Vec::new(),

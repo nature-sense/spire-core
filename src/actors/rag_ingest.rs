@@ -28,12 +28,10 @@ use std::path::{Path, PathBuf};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
-use crate::subsystems::graph::memory_graph::MemoryGraphMessage;
 use crate::config::knowledge_dir;
 use crate::models::embedding::Embedder;
-use crate::models::memory_graph::{
-    AttrNode, RelationshipInput, RelationshipType,
-};
+use crate::models::memory_graph::{AttrNode, RelationshipInput, RelationshipType};
+use crate::subsystems::graph::memory_graph::MemoryGraphMessage;
 
 // ============================================================================
 // Config schema (mirrors the user's `ingest.yaml`)
@@ -387,7 +385,10 @@ fn path_matches(path: &Path, source: &IngestSource) -> bool {
     // include_files / include_paths / exclude_paths globs may be written as
     // bare file names ("sun55i-a523.dtsi") while `path` is a full absolute
     // path. Match against the basename too so bare-name filters work.
-    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
     // include_files: explicit file allow-list (when present, must match the
     // path OR its basename — users typically write "file.dtsi").
     if !source.processing.include_files.is_empty() {
@@ -481,15 +482,16 @@ async fn fetch_source_files(source: &IngestSource, base_dir: &Path) -> Result<Ve
                             for repo in arr.iter().take(50) {
                                 if let Some(clone) = repo.get("clone_url").and_then(|v| v.as_str())
                                 {
-                                    let n = repo
-                                        .get("name")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("repo");
+                                    let n =
+                                        repo.get("name").and_then(|v| v.as_str()).unwrap_or("repo");
                                     let dir = cache_dir().join(format!("{}-{}", org, n));
                                     if !dir.join(".git").exists() {
                                         let status = tokio::process::Command::new("git")
                                             .args([
-                                                "clone", "--depth", "1", clone,
+                                                "clone",
+                                                "--depth",
+                                                "1",
+                                                clone,
                                                 dir.to_str().unwrap(),
                                             ])
                                             .status()
@@ -734,9 +736,7 @@ fn compile_patterns(config: &GraphRagConfig) -> Vec<CompiledPattern> {
 /// Entity types eligible for deterministic fuzzy/hardware-name resolution.
 /// Function-like types (HalFunction etc.) are NOT resolved — they must stay exact.
 fn is_hardware_entity_type(etype: &str) -> bool {
-    !etype.contains("Function")
-        && !etype.contains("Method")
-        && !etype.contains("Symbol")
+    !etype.contains("Function") && !etype.contains("Method") && !etype.contains("Symbol")
 }
 
 /// Known hardware-name aliases: normalize to a single canonical family token so
@@ -771,7 +771,11 @@ fn canonicalize_entity(etype: &str, value: &str) -> String {
     let split_at = v.find('@');
     if let Some(idx) = split_at {
         let (name, addr) = (&v[..idx], &v[idx + 1..]);
-        if !name.is_empty() && addr.chars().all(|c| c.is_ascii_hexdigit() || c == 'x' || c == 'X') {
+        if !name.is_empty()
+            && addr
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() || c == 'x' || c == 'X')
+        {
             return name.to_string();
         }
     }
@@ -933,7 +937,10 @@ async fn store_provenance(
             Some(format!("domain RAG corpus {corpus_version}")),
             HashMap::from([
                 ("domain".to_string(), serde_json::json!(domain)),
-                ("corpus_version".to_string(), serde_json::json!(corpus_version)),
+                (
+                    "corpus_version".to_string(),
+                    serde_json::json!(corpus_version),
+                ),
             ]),
             None,
         ),
@@ -1000,14 +1007,12 @@ pub async fn ingest_graph_config(
     let mut source_stats: Vec<(IngestSource, IngestStatus)> = Vec::new();
     // Resolve relative source paths against the manifest's own directory when
     // no project root is supplied — RAG is fully project-independent.
-    let base_dir = project_root
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| {
-            config_path
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_default()
-        });
+    let base_dir = project_root.map(Path::to_path_buf).unwrap_or_else(|| {
+        config_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default()
+    });
 
     for source in &config.pipeline.sources {
         if !source.enabled {
@@ -1239,7 +1244,10 @@ pub async fn ingest_graph_config(
                         ("reason".to_string(), serde_json::json!(st.reason.clone())),
                         ("chunks".to_string(), serde_json::json!(st.chunks)),
                         ("files".to_string(), serde_json::json!(st.files)),
-                        ("corpus_version".to_string(), serde_json::json!(report.corpus_version)),
+                        (
+                            "corpus_version".to_string(),
+                            serde_json::json!(report.corpus_version),
+                        ),
                     ]),
                     None,
                 ),

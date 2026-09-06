@@ -244,7 +244,6 @@ impl Default for ProcessModule {
 impl Actor for ProcessModule {
     type Message = ProcessMessage;
 
-
     async fn handle(&mut self, msg: Self::Message) {
         match msg {
             ProcessMessage::Spawn {

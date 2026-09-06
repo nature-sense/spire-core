@@ -106,3 +106,17 @@ lexical Jaccard with no signal.
 
 **Instead:** surface the missing `"embedder"` service at startup (warn/error),
 and fail ingest rather than storing un-embeddable chunks.
+
+## 13. Storing coordinates as JSON strings
+
+Spatial queries pre-filter with GQL numeric range predicates
+(`WHERE n.latitude >= …`), which only work on **native scalar number
+properties**. Hand-serializing coordinates into a JSON string (e.g. a `geo`
+property that is one blob) makes the node invisible to every range scan, so the
+actor falls back to parsing each candidate — slow and fragile.
+
+**Instead:** use the `AttrNode` spatial helpers (`set_geo_point` /
+`set_spatial_geometry`), which write scalar `latitude`/`longitude` (or
+`min_lng`/`min_lat`/`max_lng`/`max_lat`) columns **and** keep the optional
+`geometry` property for exact `Contains`/`Intersects` refinement. See
+[`docs/spatial.md`](spatial.md).

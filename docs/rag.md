@@ -139,6 +139,21 @@ vectors), scoring falls back to **lexical Jaccard overlap** so the tool keeps
 working — but this is a fallback, not a target. `RagActor::FindInterfaces`
 queries `AstFunction`/`AstClass` interface nodes the same way.
 
+### Spatial + semantic retrieval
+
+Nodes in the same store can carry **both** an embedding and WGS84 location
+(`AttrNode::set_geo_point` / `set_spatial_geometry`). Two application-side
+compositions make retrieval place-aware:
+
+- **Spatial pre-filter → semantic re-rank** — `MemoryGraphMessage::SpatialQuery`
+  (e.g. `Radius`, `Contains`) narrows geotagged nodes to a region, then the
+  survivors are embedded/cosine-ranked.
+- **Semantic candidates → spatial validation** — `RagActor::Query` returns
+  `top_k` chunks; keep only those whose node lies in the region of interest.
+
+See [`docs/spatial.md`](spatial.md) for the storage model and the `SpatialQuery`
+API.
+
 ## Versioning & idempotency
 
 - `corpus_version_for` is a **pure function of the config** → identical

@@ -7,11 +7,11 @@
 
 use std::sync::Arc;
 
-use spire_core::subsystems::graph::memory_graph::MemoryGraphActor;
 use spire_core::actors::rag_ingest::{self, IngestContext};
 use spire_core::actors::Actor;
 use spire_core::embedder::NoopEmbedder;
 use spire_core::models::embedding::Embedder;
+use spire_core::subsystems::graph::memory_graph::MemoryGraphActor;
 use tokio::sync::{mpsc, oneshot};
 
 #[tokio::main]
@@ -19,7 +19,11 @@ async fn main() {
     let knowledge = dirs::home_dir().unwrap().join(".spire/knowledge");
     let manifest = knowledge.join("a7s/ingest.yaml");
     println!("knowledge dir : {}", knowledge.display());
-    println!("manifest       : {} exists={}", manifest.display(), manifest.exists());
+    println!(
+        "manifest       : {} exists={}",
+        manifest.display(),
+        manifest.exists()
+    );
 
     let (tx, rx) = mpsc::channel(64);
     let _join = MemoryGraphActor::new().spawn(rx);
@@ -96,8 +100,10 @@ async fn main() {
             Ok(Ok(sources)) => {
                 println!("LIST_SOURCES count={} :", sources.len());
                 for s in &sources {
-                    println!("  {} status={} chunks={} files={} reason={}",
-                        s.id, s.status, s.chunks, s.files, s.reason);
+                    println!(
+                        "  {} status={} chunks={} files={} reason={}",
+                        s.id, s.status, s.chunks, s.files, s.reason
+                    );
                 }
             }
             Ok(Err(e)) => println!("LIST_SOURCES error: {e}"),

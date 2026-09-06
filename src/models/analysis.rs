@@ -301,4 +301,3 @@ mod tests {
         assert!(attr_ast_function().diagnostic().is_none());
     }
 }
-

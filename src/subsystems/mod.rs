@@ -8,8 +8,8 @@
 //! one subsystem at a time (graph → llm → tools → mcp → build → project →
 //! planning → chat) with `actors/mod.rs` re-exporting old paths meanwhile.
 
+pub mod chat;
 pub mod graph;
 pub mod llm;
-pub mod chat;
 pub mod mcp;
 pub mod tools;

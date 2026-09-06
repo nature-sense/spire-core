@@ -122,10 +122,7 @@ pub fn global_config_json() -> Value {
         "deepseek.planning_model".to_string(),
         json!(cfg.planning_model),
     );
-    out.insert(
-        "deepseek.coding_model".to_string(),
-        json!(cfg.coding_model),
-    );
+    out.insert("deepseek.coding_model".to_string(), json!(cfg.coding_model));
     // Web-search API keys (Tavily) — surfaced for the settings UI.
     out.insert(
         "tavily.api_key".to_string(),

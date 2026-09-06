@@ -192,7 +192,10 @@ pub fn discover_build_files(root: &Path, _no_ignore: bool) -> Vec<(String, Strin
                 // modules are defined) — adding a module never requires editing
                 // this core crate.
                 let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if crate::build_types::all_config_file_names().iter().any(|c| c == &filename) {
+                if crate::build_types::all_config_file_names()
+                    .iter()
+                    .any(|c| c == &filename)
+                {
                     // A `meson.build` WITHOUT a `project(...)` call is NOT a
                     // buildable project — it's a platform module / subdir spec
                     // (e.g. `rpi/hal/meson.build` in the ai-traps cross-platform
@@ -307,9 +310,9 @@ fn should_skip(relative: &str) -> bool {
     // as phantom entries in the file tree. Also skip any directory whose
     // name starts with "build" (build, build-native, build-* ...) so Meson/
     // CMake generated artifacts are never mistaken for source directories.
-    parts.iter().any(|p| {
-        is_hidden(p.as_ref()) || SKIP_DIRS.contains(p) || p.starts_with("build")
-    })
+    parts
+        .iter()
+        .any(|p| is_hidden(p.as_ref()) || SKIP_DIRS.contains(p) || p.starts_with("build"))
 }
 
 /// True when the given `Cargo.toml` belongs to a workspace MEMBER crate, i.e.
@@ -365,10 +368,7 @@ fn is_cargo_workspace_member(manifest: &Path) -> bool {
             .to_string();
         let member_rel = member_rel.trim_matches('/').to_string();
         // members = ["core", "rpi5", "rock3c"] (inline or multi-line).
-        let member_re = regex::Regex::new(
-            r#"(?m)members\s*=\s*\[([^\]]*)\]"#,
-        )
-        .unwrap();
+        let member_re = regex::Regex::new(r#"(?m)members\s*=\s*\[([^\]]*)\]"#).unwrap();
         let is_member = member_re
             .captures(&root_content)
             .and_then(|c| c.get(1))

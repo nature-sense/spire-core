@@ -49,6 +49,22 @@ Patterns that keep `spire-core` actors fast, correct, and maintainable.
 - **Batch GQL** (`MemoryGraphMessage::BatchGql`) for bulk operations instead of
   N round-trips.
 
+## Spatial queries
+
+- **Store location with the `AttrNode` helpers**, never by hand-writing JSON.
+  `set_geo_point` / `set_spatial_geometry` keep the scalar `min_lng`/`min_lat`/
+  `max_lng`/`max_lat` bounding-box columns in sync — the GQL pre-filter scans
+  exactly those columns.
+- **Coordinates must be scalar numbers.** Range predicates
+  (`WHERE n.latitude >= …`) only match native numeric properties; a JSON-encoded
+  coordinate string is opaque to GQL.
+- **Use `MemoryGraphMessage::SpatialQuery`, not hand-rolled geometry loops.**
+  The actor pre-filters by bounding box and refines with the exact `geo`
+  predicates in `crate::spatial` (bounding box, radius, k-nearest, contains,
+  intersects — all in WGS84 lon/lat, distances in meters).
+- **Query with a filter budget.** Pass `node_type`/`subtype` and keep `limit`
+  small; `total_results`/`truncated` on the result tell you when you capped.
+
 ## Embeddings & RAG
 
 - **Share one embedder instance** (`CandleEmbedder` is expensive to construct —

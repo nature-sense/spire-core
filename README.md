@@ -17,6 +17,7 @@ This document is the crate overview. Detailed guides live in [`docs/`](docs/):
 | [`docs/rag.md`](docs/rag.md) | RAG knowledge store and efficient ingestion |
 | [`docs/use-cases.md`](docs/use-cases.md) | Real-world usage patterns |
 | [`docs/examples.md`](docs/examples.md) | Runnable code examples |
+| [`docs/spatial.md`](docs/spatial.md) | WGS84 spatial queries over the memory graph |
 | [`docs/best-practices.md`](docs/best-practices.md) | Recommended patterns |
 | [`docs/anti-patterns.md`](docs/anti-patterns.md) | Things to avoid |
 
@@ -39,6 +40,11 @@ Spire AI coding platform:
 - **RAG knowledge store** — per-domain retrieval-augmented generation:
   `ingest.yaml`-driven ingestion (`rag_ingest`) and cosine-similarity retrieval
   (`RagActor`).
+- **Spatial queries** — WGS84 geometry over the knowledge graph: bounding box,
+  radius, k-nearest, contains, and intersects (`spatial` functions +
+  `MemoryGraphMessage::SpatialQuery`).
+- **Vector tiles** — `TileActor` + `tiles` encoder turn spatial features into
+  cached MVT bytes for map UIs (`GetTile` / `GetTileFeatures`).
 - **Embedding** — local text embeddings via Candle (`all-MiniLM-L6-v2`, 384-d).
 - **LLM client** — DeepSeek-compatible completions, streaming, and
   tool/role-aware calls (`LlmActor`).
@@ -101,6 +107,8 @@ name + type at `init` time and cached — never on the hot path.
 | [`config`](src/config.rs) | User-level config (`~/.spire`), LLM settings, knowledge dir. |
 | [`build_types`](src/build_types.rs) | Cross-platform build metadata contract types. |
 | [`platform`](src/platform.rs) | Cross-compilation platform definitions and cross-file generation. |
+| [`spatial`](src/spatial.rs) | Pure WGS84 geometry: haversine distance, bounding boxes, contains/intersects predicates (backing `SpatialQuery`). |
+| [`tiles`](src/tiles.rs) | MVT (Mapbox Vector Tile) encoding of graph features for map UIs. |
 | [`transport`](src/transport/mod.rs) | `TransportActor` — JSON-RPC 2.0 over TCP. |
 
 ## Quick start

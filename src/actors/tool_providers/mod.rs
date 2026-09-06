@@ -17,8 +17,8 @@ use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::subsystems::mcp::mcp_client::McpClientMessage;
 use crate::actors::ToolInfo;
+use crate::subsystems::mcp::mcp_client::McpClientMessage;
 
 /// Messages for the ToolRouterActor.
 pub enum ToolRouterMessage {
@@ -49,10 +49,7 @@ pub struct ToolRouterActor {
 
 impl ToolRouterActor {
     /// Create a router backed by the given (pre-populated) registry.
-    pub fn new(
-        registry: Arc<ToolRegistry>,
-        mcp_client_tx: mpsc::Sender<McpClientMessage>,
-    ) -> Self {
+    pub fn new(registry: Arc<ToolRegistry>, mcp_client_tx: mpsc::Sender<McpClientMessage>) -> Self {
         Self {
             registry,
             mcp_client_tx,
