@@ -399,9 +399,10 @@ pub async fn clear_domain(
 }
 
 /// Ensure a shallow clone of `url` exists at `dir`. When the cache already
-/// exists it is refreshed with a best-effort `git pull` so a re-ingest picks
-/// up upstream changes; a failed refresh keeps the cached copy (offline-safe)
-/// rather than failing the whole corpus.
+/// exists it is refreshed with a best-effort `git fetch --depth 1 origin` +
+/// `git reset --hard FETCH_HEAD` (a shallow clone cannot fast-forward) so a
+/// re-ingest picks up upstream changes; a failed refresh keeps the cached copy
+/// (offline-safe) rather than failing the whole corpus.
 async fn clone_or_pull(url: &str, dir: &Path) -> Result<()> {
     std::fs::create_dir_all(
         dir.parent()
@@ -417,24 +418,33 @@ async fn clone_or_pull(url: &str, dir: &Path) -> Result<()> {
         }
         return Ok(());
     }
-    // Refresh the cached shallow clone (best-effort: offline/failed pulls keep
-    // the cached copy so ingestion can still proceed).
-    let status = tokio::process::Command::new("git")
+    // Refresh the cached shallow clone (best-effort: offline/failed refreshes
+    // keep the cached copy so ingestion can still proceed). A `--depth 1` clone
+    // cannot fast-forward after upstream moves (no shared history), so fetch
+    // the new tip and hard-reset the disposable cache onto it.
+    let fetch_ok = tokio::process::Command::new("git")
         .args([
             "-C",
             dir.to_str().unwrap(),
-            "pull",
-            "--ff-only",
+            "fetch",
             "--depth",
             "1",
+            "origin",
         ])
         .status()
-        .await?;
-    if status.success() {
+        .await?
+        .success();
+    let reset_ok = fetch_ok
+        && tokio::process::Command::new("git")
+            .args(["-C", dir.to_str().unwrap(), "reset", "--hard", "FETCH_HEAD"])
+            .status()
+            .await?
+            .success();
+    if reset_ok {
         info!("refreshed cached clone of {url} at {}", dir.display());
     } else {
         warn!(
-            "git pull failed for {url} at {} — using the existing cached copy",
+            "git fetch/reset failed for {url} at {} — using the existing cached copy",
             dir.display()
         );
     }

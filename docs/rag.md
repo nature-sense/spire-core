@@ -163,10 +163,11 @@ queries `AstFunction`/`AstClass` interface nodes the same way.
 
 - **GitHub sources refresh themselves.** `github_repo` and `github_org` clones
   live in `~/.spire/knowledge/.cache/<source-id>` as shallow `--depth 1` clones.
-  On every ingest `rag_ingest` runs a best-effort `git pull --ff-only` when the
-  cached clone already exists, so re-ingestion picks up pushed changes without
-  deleting the cache. A failed pull (offline, auth, …) keeps the cached copy and
-  ingests from it rather than failing the corpus.
+  On every ingest `rag_ingest` refreshes an existing cached clone with a
+  best-effort `git fetch --depth 1 origin` + `git reset --hard FETCH_HEAD` (a
+  shallow clone cannot fast-forward), so re-ingestion picks up pushed changes
+  without deleting the cache. A failed refresh (offline, auth, …) keeps the
+  cached copy and ingests from it rather than failing the corpus.
 - **Re-ingest = clear + ingest.** The durable way to refresh a corpus whose
   source changed is `RagMessage::ReingestGraphConfig` — the RAG panel's
   **Reingest** button (RPC `rag/reingest-graph-config`). It resolves the
