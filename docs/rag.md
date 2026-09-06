@@ -39,7 +39,7 @@ MemoryGraphActor (knowledge store)     ←─── RagActor::Query
 
 | Component | Role |
 | --- | --- |
-| `actors::rag::RagActor` | Retrieval entry point (`Query`, `FindInterfaces`) and ingestion control (`IngestGraphConfig`, `ListManifests`, `ListDomains`, `ListSources`). |
+| `actors::rag::RagActor` | Retrieval entry point (`Query`, `FindInterfaces`) and ingestion control (`IngestGraphConfig`, `ReingestGraphConfig`, `ListManifests`, `ListDomains`, `ListSources`). |
 | `actors::rag_ingest` | Parser + executor for `ingest.yaml` (`GraphRagConfig`); pure functions `resolve_domain` and `corpus_version_for`. |
 | `subsystems::graph::MemoryGraphActor` | The store behind both the project graph and the KnowledgeStore. All RAG reads/writes go through its messages. |
 | `models::embedding::Embedder` | The embedding seam. Ingest and retrieval both use the *same* shared `Arc<dyn Embedder>`. |
@@ -146,10 +146,33 @@ queries `AstFunction`/`AstClass` interface nodes the same way.
   converges instead of duplicating.
 - The version is stored on the `rag_domain` node; `RagDomainInfo.corpus_version`
   exposes it to the UI.
-- Changed manifests produce a new version; stale chunks/entities from the old
-  version are replaced or pruned rather than appended.
+- Changed manifests produce a new version. `IngestGraphConfig` is an idempotent
+  **upsert** — chunk/entity names are content-addressed, so unchanged content
+  converges (no duplicates) while changed content is added under new names.
+- `ReingestGraphConfig` (the RAG panel **Reingest** button /
+  `rag/reingest-graph-config`) is a true **replace**: it resolves the manifest's
+  domain, clears its `rag_chunk`/`rag_entity`/`rag_source` nodes
+  (`rag_ingest::clear_domain`, relationships auto-delete, the `rag_domain` node
+  survives), then ingests from scratch — stale chunks/entities from older
+  content are pruned, not left behind. Use it after source content, the
+  manifest, or the embedding config changes.
 - Per-source status nodes make the pipeline **resumable**: `ListSources` shows
   exactly what landed and why anything was skipped.
+
+## Refreshing remote sources & re-ingesting
+
+- **GitHub sources refresh themselves.** `github_repo` and `github_org` clones
+  live in `~/.spire/knowledge/.cache/<source-id>` as shallow `--depth 1` clones.
+  On every ingest `rag_ingest` runs a best-effort `git pull --ff-only` when the
+  cached clone already exists, so re-ingestion picks up pushed changes without
+  deleting the cache. A failed pull (offline, auth, …) keeps the cached copy and
+  ingests from it rather than failing the corpus.
+- **Re-ingest = clear + ingest.** The durable way to refresh a corpus whose
+  source changed is `RagMessage::ReingestGraphConfig` — the RAG panel's
+  **Reingest** button (RPC `rag/reingest-graph-config`). It resolves the
+  manifest's domain (`rag_ingest::resolve_domain_for_manifest`), removes the
+  domain's corpus nodes, then ingests from scratch. Plain **Ingest** remains an
+  idempotent upsert for re-running an unchanged manifest.
 
 ## Practices for efficient RAG ingestion
 
