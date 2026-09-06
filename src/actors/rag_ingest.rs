@@ -323,6 +323,124 @@ pub fn corpus_version_for(config: &GraphRagConfig) -> String {
         .to_string()
 }
 
+/// Resolve the corpus/domain id a manifest ingests into by parsing it and
+/// combining `pipeline.corpus` with the manifest's own directory name
+/// (`~/.spire/knowledge/<corpus>/ingest.yaml`).
+pub fn resolve_domain_for_manifest(manifest_path: &Path) -> Result<String> {
+    let yaml = std::fs::read_to_string(manifest_path)
+        .map_err(|e| anyhow!("read manifest {}: {e}", manifest_path.display()))?;
+    let config: GraphRagConfig = serde_yaml::from_str(&yaml)
+        .map_err(|e| anyhow!("parse manifest {}: {e}", manifest_path.display()))?;
+    let manifest_dir = manifest_path
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    Ok(corpus_domain(&config, &manifest_dir))
+}
+
+/// Counts of domain nodes removed by [`clear_domain`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ClearResult {
+    pub chunks: usize,
+    pub entities: usize,
+    pub sources: usize,
+}
+
+/// Delete one subtype of domain-owned corpus nodes (returns how many matched).
+async fn delete_domain_nodes(
+    knowledge_tx: &mpsc::Sender<MemoryGraphMessage>,
+    subtype: &str,
+    domain: &str,
+) -> Result<usize> {
+    let (tx, rx) = oneshot::channel();
+    knowledge_tx
+        .send(MemoryGraphMessage::QueryAttrNodes {
+            node_type: Some("Unknown".to_string()),
+            subtype: Some(subtype.to_string()),
+            name: None,
+            limit: Some(1_000_000),
+            reply_to: tx,
+        })
+        .await?;
+    let nodes = rx.await??;
+    let mine: Vec<AttrNode> = nodes
+        .into_iter()
+        .filter(|n| n.get("domain").and_then(|v| v.as_str()) == Some(domain))
+        .collect();
+    for n in &mine {
+        let (t, r) = oneshot::channel();
+        knowledge_tx
+            .send(MemoryGraphMessage::DeleteNode {
+                id: n.id().to_string(),
+                reply_to: t,
+            })
+            .await?;
+        r.await?
+            .map_err(|e| anyhow!("delete {subtype} {}: {e}", n.id()))?;
+    }
+    Ok(mine.len())
+}
+
+/// Delete every `rag_chunk` / `rag_entity` / `rag_source` node belonging to
+/// `domain` (relationships are auto-deleted with their endpoints). The
+/// `rag_domain` node is kept — ingestion re-merges it on the next ingest.
+/// Call before a full re-ingest so changed content *replaces* stale chunks
+/// instead of appending alongside them.
+pub async fn clear_domain(
+    knowledge_tx: &mpsc::Sender<MemoryGraphMessage>,
+    domain: &str,
+) -> Result<ClearResult> {
+    Ok(ClearResult {
+        chunks: delete_domain_nodes(knowledge_tx, "rag_chunk", domain).await?,
+        entities: delete_domain_nodes(knowledge_tx, "rag_entity", domain).await?,
+        sources: delete_domain_nodes(knowledge_tx, "rag_source", domain).await?,
+    })
+}
+
+/// Ensure a shallow clone of `url` exists at `dir`. When the cache already
+/// exists it is refreshed with a best-effort `git pull` so a re-ingest picks
+/// up upstream changes; a failed refresh keeps the cached copy (offline-safe)
+/// rather than failing the whole corpus.
+async fn clone_or_pull(url: &str, dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(
+        dir.parent()
+            .ok_or_else(|| anyhow!("no parent for {}", dir.display()))?,
+    )?;
+    if !dir.join(".git").exists() {
+        let status = tokio::process::Command::new("git")
+            .args(["clone", "--depth", "1", url, dir.to_str().unwrap()])
+            .status()
+            .await?;
+        if !status.success() {
+            return Err(anyhow!("git clone failed for {url}"));
+        }
+        return Ok(());
+    }
+    // Refresh the cached shallow clone (best-effort: offline/failed pulls keep
+    // the cached copy so ingestion can still proceed).
+    let status = tokio::process::Command::new("git")
+        .args([
+            "-C",
+            dir.to_str().unwrap(),
+            "pull",
+            "--ff-only",
+            "--depth",
+            "1",
+        ])
+        .status()
+        .await?;
+    if status.success() {
+        info!("refreshed cached clone of {url} at {}", dir.display());
+    } else {
+        warn!(
+            "git pull failed for {url} at {} — using the existing cached copy",
+            dir.display()
+        );
+    }
+    Ok(())
+}
+
 // ============================================================================
 // Source fetching (Phase 2: local + remote)
 // ============================================================================
@@ -450,16 +568,7 @@ async fn fetch_source_files(source: &IngestSource, base_dir: &Path) -> Result<Ve
                 return Err(anyhow!("github_repo requires a url"));
             }
             let dir = cache_dir().join(&source.id);
-            if !dir.join(".git").exists() {
-                std::fs::create_dir_all(dir.parent().unwrap())?;
-                let status = tokio::process::Command::new("git")
-                    .args(["clone", "--depth", "1", &url, dir.to_str().unwrap()])
-                    .status()
-                    .await?;
-                if !status.success() {
-                    return Err(anyhow!("git clone failed for {}", url));
-                }
-            }
+            clone_or_pull(&url, &dir).await?;
             Ok(collect_local_files(&dir, source))
         }
         "github_org" => {
@@ -485,21 +594,7 @@ async fn fetch_source_files(source: &IngestSource, base_dir: &Path) -> Result<Ve
                                     let n =
                                         repo.get("name").and_then(|v| v.as_str()).unwrap_or("repo");
                                     let dir = cache_dir().join(format!("{}-{}", org, n));
-                                    if !dir.join(".git").exists() {
-                                        let status = tokio::process::Command::new("git")
-                                            .args([
-                                                "clone",
-                                                "--depth",
-                                                "1",
-                                                clone,
-                                                dir.to_str().unwrap(),
-                                            ])
-                                            .status()
-                                            .await?;
-                                        if status.success() {
-                                            all.extend(collect_local_files(&dir, source));
-                                        }
-                                    } else {
+                                    if clone_or_pull(clone, &dir).await.is_ok() {
                                         all.extend(collect_local_files(&dir, source));
                                     }
                                 }

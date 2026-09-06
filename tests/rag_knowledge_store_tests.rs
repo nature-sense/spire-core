@@ -21,10 +21,12 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use spire_core::actors::rag::{RagActor, RagMessage};
+use spire_core::actors::rag_ingest::IngestReport;
 use spire_core::actors::Actor;
 use spire_core::embedder::create_embedder;
-use spire_core::models::embedding::Embedder;
+use spire_core::models::embedding::{Embedder, Embedding};
 use spire_core::subsystems::graph::memory_graph::MemoryGraphActor;
 
 use tokio::sync::{mpsc, oneshot};
@@ -131,6 +133,74 @@ async fn query_rag(
         .await
         .expect("send query");
     r.await.expect("query reply").expect("query ok")
+}
+
+/// Deterministic no-network embedder for shape/count tests (the semantic
+/// tests gate on `try_real_embedder` instead).
+struct MockEmbedder;
+
+#[async_trait]
+impl Embedder for MockEmbedder {
+    async fn embed(&self, text: &str) -> anyhow::Result<Embedding> {
+        Ok(Embedding::new(vec![1.0, 0.0, 0.0], text, "mock"))
+    }
+    async fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Embedding>> {
+        Ok(texts
+            .iter()
+            .map(|t| Embedding::new(vec![1.0, 0.0, 0.0], t, "mock"))
+            .collect())
+    }
+    fn dimensions(&self) -> usize {
+        3
+    }
+}
+
+/// Send `IngestGraphConfig` and await the report.
+async fn ingest_manifest(
+    rag_tx: &mpsc::Sender<RagMessage>,
+    manifest_path: PathBuf,
+) -> IngestReport {
+    let (t, r) = oneshot::channel();
+    rag_tx
+        .send(RagMessage::IngestGraphConfig {
+            manifest_path,
+            project_root: None,
+            reply_to: t,
+        })
+        .await
+        .unwrap();
+    r.await.unwrap().expect("ingest config")
+}
+
+/// Send `ReingestGraphConfig` (clear-then-ingest) and await the report.
+async fn reingest_manifest(
+    rag_tx: &mpsc::Sender<RagMessage>,
+    manifest_path: PathBuf,
+) -> IngestReport {
+    let (t, r) = oneshot::channel();
+    rag_tx
+        .send(RagMessage::ReingestGraphConfig {
+            manifest_path,
+            project_root: None,
+            reply_to: t,
+        })
+        .await
+        .unwrap();
+    r.await.unwrap().expect("reingest config")
+}
+
+/// Spawn a KnowledgeStore + RagActor (provenance → same store) with `embedder`.
+async fn spawn_store_and_rag(
+    dir: &std::path::Path,
+    embedder: &Arc<dyn Embedder>,
+) -> (
+    mpsc::Sender<spire_core::actors::MemoryGraphMessage>,
+    mpsc::Sender<RagMessage>,
+) {
+    let store_tx = spawn_graph(dir, embedder).await;
+    let (rag_tx, rx) = mpsc::channel(64);
+    let _join = RagActor::new(store_tx.clone(), store_tx.clone(), embedder.clone()).spawn(rx);
+    (store_tx, rag_tx)
 }
 
 /// Write a canonical `ingest.yaml` with a local docs source + domains +
@@ -423,4 +493,100 @@ async fn ingest_without_project() {
     // The corpus is queryable from the shared KnowledgeStore.
     let hits = query_rag(&rag_tx, "a7s", "NPU").await;
     assert!(!hits.is_empty(), "query works without any project open");
+}
+
+/// `ReingestGraphConfig` = clear-then-ingest: after the source content changes,
+/// a re-ingest must produce EXACTLY what a fresh ingest of the changed docs
+/// produces — stale chunks from the old content are pruned, not appended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reingest_graph_config_replaces_stale_content() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder);
+    let tmp = tempfile::tempdir().unwrap();
+
+    // Store A: ingest the v1 docs, then change a source and re-ingest.
+    let (store_a, rag_a) = spawn_store_and_rag(&tmp.path().join("knowledge-a"), &embedder).await;
+    let (manifest_path, docs) = write_ingest_config(tmp.path());
+    let report_v1 = ingest_manifest(&rag_a, manifest_path.clone()).await;
+    assert_eq!(report_v1.domain, "a7s");
+    assert!(report_v1.chunks > 0 && report_v1.entities > 0);
+    let v1_chunks = query_prefix(&store_a, "rag_chunk").await;
+    let v1_entities = query_prefix(&store_a, "rag_entity").await;
+
+    // Change the source: make NPU.md long enough to split into 2+ chunks.
+    let v2_body = format!(
+        "# A733 NPU pipeline v2\n\nThe A733 packs an 8-core CPU and a 3 TOPS NPU\n\
+         with a new warp engine.\n{}",
+        "Warp scheduling details for the NPU_0 engine are covered here.\n".repeat(60)
+    );
+    std::fs::write(docs.join("NPU.md"), v2_body).unwrap();
+
+    let report_v2 = reingest_manifest(&rag_a, manifest_path.clone()).await;
+    assert_eq!(report_v2.domain, "a7s");
+    let v2_chunks = query_prefix(&store_a, "rag_chunk").await;
+    let v2_entities = query_prefix(&store_a, "rag_entity").await;
+
+    // Store B: a fresh single ingest of the same changed manifest is the
+    // ground truth for "exactly the current content".
+    let (store_b, rag_b) = spawn_store_and_rag(&tmp.path().join("knowledge-b"), &embedder).await;
+    let _ = ingest_manifest(&rag_b, manifest_path).await;
+    let fresh_chunks = query_prefix(&store_b, "rag_chunk").await;
+    let fresh_entities = query_prefix(&store_b, "rag_entity").await;
+
+    assert_ne!(
+        v1_chunks.len(),
+        v2_chunks.len(),
+        "the content change must alter the corpus so the prune check is meaningful"
+    );
+    assert!(
+        v1_entities
+            .iter()
+            .all(|e| v2_entities.iter().any(|n| n == e)),
+        "cleared entities must be re-extracted identically to a fresh ingest"
+    );
+    assert_eq!(
+        v2_chunks,
+        fresh_chunks,
+        "reingest must equal a fresh ingest (stale chunks pruned): {} vs {} chunks",
+        v2_chunks.len(),
+        fresh_chunks.len()
+    );
+    assert_eq!(
+        v2_entities,
+        fresh_entities,
+        "reingest entities must equal a fresh ingest: {} vs {}",
+        v2_entities.len(),
+        fresh_entities.len()
+    );
+}
+
+/// `clear_domain` removes every corpus node of a domain from the KnowledgeStore
+/// while keeping the `rag_domain` node (provenance/staleness still resolves).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clear_domain_removes_corpus_and_keeps_domain_node() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder);
+    let tmp = tempfile::tempdir().unwrap();
+    let (store_tx, rag_tx) = spawn_store_and_rag(&tmp.path().join("knowledge"), &embedder).await;
+    let (manifest_path, _docs) = write_ingest_config(tmp.path());
+    let report = ingest_manifest(&rag_tx, manifest_path).await;
+    assert!(report.chunks > 0 && report.entities > 0);
+    assert!(!query_prefix(&store_tx, "rag_domain").await.is_empty());
+
+    let cleared = spire_core::actors::rag_ingest::clear_domain(&store_tx, "a7s")
+        .await
+        .expect("clear domain");
+    assert!(cleared.chunks > 0, "chunks were cleared");
+    assert!(cleared.entities > 0, "entities were cleared");
+    assert!(cleared.sources > 0, "source status was cleared");
+    assert!(query_prefix(&store_tx, "rag_chunk").await.is_empty());
+    assert!(query_prefix(&store_tx, "rag_entity").await.is_empty());
+    assert!(query_prefix(&store_tx, "rag_source").await.is_empty());
+    assert!(
+        query_prefix(&store_tx, "rag_domain")
+            .await
+            .iter()
+            .any(|n| n.contains("a7s")),
+        "rag_domain node must survive so re-ingest/provenance still resolves"
+    );
 }

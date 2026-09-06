@@ -24,6 +24,7 @@ use async_trait::async_trait;
 use spire_actor::registry::ServiceRegistry;
 use std::path::{Path, PathBuf};
 use tokio::sync::{mpsc, oneshot};
+use tracing::info;
 
 // ============================================================================
 // RAG types
@@ -114,6 +115,14 @@ pub enum RagMessage {
     /// `project_root` is optional: relative source paths resolve against the
     /// manifest's own directory when None — RAG is project-independent.
     IngestGraphConfig {
+        manifest_path: PathBuf,
+        project_root: Option<PathBuf>,
+        reply_to: oneshot::Sender<Result<IngestReport>>,
+    },
+    /// Clear the manifest's target domain and then ingest from scratch — the
+    /// durable "reingest" that REPLACES stale content instead of appending to
+    /// it (for changed docs/sources/embedding settings).
+    ReingestGraphConfig {
         manifest_path: PathBuf,
         project_root: Option<PathBuf>,
         reply_to: oneshot::Sender<Result<IngestReport>>,
@@ -401,6 +410,23 @@ impl RagActor {
         };
         rag_ingest::ingest_graph_config(&ctx, manifest_path, project_root).await
     }
+
+    /// Clear the manifest's target domain (chunks/entities/source status) and
+    /// then ingest from scratch, so changed content replaces — not appends to —
+    /// the existing corpus. The `rag_domain` node survives (re-merged on ingest).
+    async fn reingest_graph_config(
+        &self,
+        manifest_path: &Path,
+        project_root: Option<&Path>,
+    ) -> Result<IngestReport> {
+        let domain = rag_ingest::resolve_domain_for_manifest(manifest_path)?;
+        let cleared = rag_ingest::clear_domain(&self.knowledge_tx, &domain).await?;
+        info!(
+            "rag: reingest '{domain}': cleared {} chunk(s), {} entit(y/ies), {} source(s)",
+            cleared.chunks, cleared.entities, cleared.sources
+        );
+        self.ingest_graph_config(manifest_path, project_root).await
+    }
 }
 
 /// Shared semantic retrieval over `rag_chunk` nodes.
@@ -629,6 +655,16 @@ impl Actor for RagActor {
             } => {
                 let r = self
                     .ingest_graph_config(&manifest_path, project_root.as_deref())
+                    .await;
+                let _ = reply_to.send(r);
+            }
+            RagMessage::ReingestGraphConfig {
+                manifest_path,
+                project_root,
+                reply_to,
+            } => {
+                let r = self
+                    .reingest_graph_config(&manifest_path, project_root.as_deref())
                     .await;
                 let _ = reply_to.send(r);
             }
