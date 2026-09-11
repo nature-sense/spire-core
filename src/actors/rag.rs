@@ -140,6 +140,11 @@ pub enum RagMessage {
         top_k: usize,
         reply_to: oneshot::Sender<Result<Vec<RagChunkResult>>>,
     },
+    /// Set the UI-selected default domain. `None` clears it. Search tools whose
+    /// `domain` is empty resolve against this value inside the actor.
+    SetDefaultDomain {
+        domain: Option<String>,
+    },
 }
 
 // ============================================================================
@@ -154,6 +159,10 @@ pub struct RagActor {
     /// `Project → uses_platform_rag(platform_id, corpus_version)` edge.
     memory_graph_tx: mpsc::Sender<MemoryGraphMessage>,
     embedder: std::sync::Arc<dyn Embedder>,
+    /// UI-selected default domain (`rag/set-domain`). Actor-owned so search
+    /// tools with an empty `domain` resolve against a single, mailbox-serialized
+    /// value instead of a shared `Arc<Mutex<Option<String>>>`.
+    default_domain: Option<String>,
 }
 
 impl RagActor {
@@ -166,6 +175,7 @@ impl RagActor {
             knowledge_tx,
             memory_graph_tx,
             embedder,
+            default_domain: None,
         }
     }
 
@@ -179,6 +189,7 @@ impl RagActor {
             knowledge_tx: memory_graph_tx.clone(),
             memory_graph_tx,
             embedder,
+            default_domain: None,
         }
     }
 
@@ -197,6 +208,18 @@ impl RagActor {
             knowledge_tx,
             memory_graph_tx,
             embedder,
+            default_domain: None,
+        }
+    }
+
+    /// Resolve a caller-supplied domain against the actor's default. An empty
+    /// `domain` means "use the UI-selected default" (falling back to "" — the
+    /// pre-actor behaviour when no default was ever set).
+    fn resolve_domain(&self, domain: String) -> String {
+        if domain.is_empty() {
+            self.default_domain.clone().unwrap_or_default()
+        } else {
+            domain
         }
     }
 
@@ -634,6 +657,7 @@ impl Actor for RagActor {
                 top_k,
                 reply_to,
             } => {
+                let domain = self.resolve_domain(domain);
                 let r = self.query(&domain, &query, top_k).await;
                 let _ = reply_to.send(r);
             }
@@ -678,9 +702,13 @@ impl Actor for RagActor {
                 top_k,
                 reply_to,
             } => {
+                let domain = self.resolve_domain(domain);
                 let r = find_interfaces(&self.knowledge_tx, &self.embedder, &domain, &query, top_k)
                     .await;
                 let _ = reply_to.send(r);
+            }
+            RagMessage::SetDefaultDomain { domain } => {
+                self.default_domain = domain;
             }
         }
     }
