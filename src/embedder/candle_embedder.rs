@@ -24,6 +24,14 @@ const EXPECTED_DIMS: usize = 384;
 /// files are expected (e.g. `<binary_dir>/models/all-MiniLM-L6-v2/`).
 const BUNDLED_MODEL_DIR: &str = "models/all-MiniLM-L6-v2";
 
+/// Shared per-user model cache, e.g. `~/.cache/huggingface/models/all-MiniLM-L6-v2/`.
+/// Mirrors the HF hub root layout so all Spire apps on this machine (spire-code,
+/// spire-gis, ...) reuse one copy of the weights.
+const USER_CACHE_ROOT: &str = ".cache/huggingface/models/all-MiniLM-L6-v2";
+
+/// Files the embedder needs, in download/cache order.
+const MODEL_FILES: [&str; 3] = ["config.json", "tokenizer.json", "model.safetensors"];
+
 /// A Candle-based embedder using the all-MiniLM-L6-v2 Sentence Transformer model.
 ///
 /// This struct loads the model weights via `hf-hub` (cached at
@@ -52,16 +60,50 @@ impl CandleEmbedder {
     /// 2. Hugging Face Hub cache (`~/.cache/huggingface/hub/`)
     /// 3. Download from Hugging Face Hub (requires network)
     pub fn new() -> Result<Self> {
+        // Preferred device (Metal on Apple Silicon unless disabled).
         let device = Self::select_device();
+        #[cfg(target_os = "macos")]
+        let preferred_is_metal = matches!(&device, Device::Metal(_));
+        #[cfg(not(target_os = "macos"))]
+        let preferred_is_metal = false;
 
-        // Try bundled path first (model shipped alongside the binary in VSIX)
+        match Self::load_preferred(&device) {
+            Ok(embedder) => match embedder.smoke_test() {
+                Ok(()) => {
+                    info!("Embedding model ready on {:?}", device);
+                    Ok(embedder)
+                }
+                Err(e) if preferred_is_metal => {
+                    // Candle's Metal backend lacks some BERT ops (e.g. some
+                    // layer-norm paths). Recover by reloading on CPU so the
+                    // embedder never silently fails at inference time.
+                    warn!(
+                        "Embedding inference failed on Metal ({}); reloading on CPU",
+                        e
+                    );
+                    let cpu = Device::Cpu;
+                    let embedder = Self::load_preferred(&cpu)?;
+                    embedder.smoke_test()?;
+                    info!("Embedding model ready on CPU (Metal inference fallback)");
+                    Ok(embedder)
+                }
+                Err(e) => Err(e),
+            },
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Load from bundled dir if present, else the shared user cache, else
+    /// Hugging Face Hub (cache/download).
+    fn load_preferred(device: &Device) -> Result<Self> {
+        // 1) Bundled path first (model shipped alongside the binary in VSIX)
         if let Some(bundled_dir) = Self::find_bundled_model_dir() {
             info!("Found bundled model directory: {}", bundled_dir.display());
-            match Self::load_from_dir(&bundled_dir, &device) {
+            match Self::load_from_dir(&bundled_dir, device) {
                 Ok(embedder) => return Ok(embedder),
                 Err(e) => {
                     warn!(
-                        "Failed to load from bundled model directory ({}): {}. Falling back to HF.",
+                        "Failed to load from bundled model directory ({}): {}. Falling back.",
                         bundled_dir.display(),
                         e
                     );
@@ -69,12 +111,48 @@ impl CandleEmbedder {
             }
         }
 
-        // Fall back to Hugging Face Hub (cache or download)
+        // 2) Shared per-user cache (~/.cache/huggingface/models/all-MiniLM-L6-v2/)
+        if let Some(cache_dir) = Self::user_cache_dir() {
+            if Self::dir_has_model(&cache_dir) {
+                info!("Found user-cached model directory: {}", cache_dir.display());
+                match Self::load_from_dir(&cache_dir, device) {
+                    Ok(embedder) => return Ok(embedder),
+                    Err(e) => {
+                        warn!(
+                            "Failed to load from user-cached model directory ({}): {}. Falling back.",
+                            cache_dir.display(),
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
+        // 3) Hugging Face Hub (download to memory; then persisted to the cache)
         info!(
             "Loading embedding model '{}' from Hugging Face Hub on {:?}...",
             MODEL_ID, device
         );
-        Self::load_from_hf(&device)
+        Self::load_from_hf(device)
+    }
+
+    /// Run a single tiny inference to confirm the loaded model actually works
+    /// on the selected device.
+    fn smoke_test(&self) -> Result<()> {
+        self.embed_text("Singapore's forested nature reserves and parks")?;
+        Ok(())
+    }
+
+    /// Whether the embedder is running on the Metal backend.
+    pub fn device_is_metal(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            matches!(&self.device, Device::Metal(_))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
     }
 
     /// Create a `CandleEmbedder` from a specific model directory on disk.
@@ -99,6 +177,19 @@ impl CandleEmbedder {
         } else {
             None
         }
+    }
+
+    /// Shared per-user cache directory (`~/.cache/huggingface/models/all-MiniLM-L6-v2/`).
+    fn user_cache_dir() -> Option<PathBuf> {
+        let home = dirs::home_dir()?;
+        Some(home.join(USER_CACHE_ROOT))
+    }
+
+    /// Whether all three model files exist in `dir`.
+    fn dir_has_model(dir: &Path) -> bool {
+        MODEL_FILES
+            .iter()
+            .all(|f| dir.join(f).is_file())
     }
 
     /// Load model files from a local directory.
@@ -131,7 +222,7 @@ impl CandleEmbedder {
 
         let elapsed = start.elapsed();
         info!(
-            "Embedding model loaded from bundled path in {:.2}s on {:?} ({} dimensions)",
+            "Embedding model loaded from directory in {:.2}s on {:?} ({} dimensions)",
             elapsed.as_secs_f64(),
             device,
             EXPECTED_DIMS,
@@ -171,6 +262,14 @@ impl CandleEmbedder {
             .send()
             .context("Failed to download model.safetensors")?;
 
+        // Persist to the shared user cache so subsequent loads (this app and
+        // every other Spire app on the machine) hit disk instead of the network.
+        if let Some(cache_dir) = Self::user_cache_dir() {
+            if let Err(e) = Self::persist_bytes(&cache_dir, &config_bytes, &tokenizer_bytes, &weights_bytes) {
+                warn!("Failed to persist model to user cache ({}): {e}", cache_dir.display());
+            }
+        }
+
         let embedder =
             Self::load_from_bytes(&config_bytes, &tokenizer_bytes, &weights_bytes, device)?;
 
@@ -183,6 +282,25 @@ impl CandleEmbedder {
         );
 
         Ok(embedder)
+    }
+
+    /// Write the three model files into a cache directory (creating it as needed).
+    fn persist_bytes(
+        dir: &Path,
+        config_bytes: &[u8],
+        tokenizer_bytes: &[u8],
+        weights_bytes: &[u8],
+    ) -> Result<()> {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("Failed to create model cache {}", dir.display()))?;
+        std::fs::write(dir.join("config.json"), config_bytes)
+            .context("Failed to write cached config.json")?;
+        std::fs::write(dir.join("tokenizer.json"), tokenizer_bytes)
+            .context("Failed to write cached tokenizer.json")?;
+        std::fs::write(dir.join("model.safetensors"), weights_bytes)
+            .context("Failed to write cached model.safetensors")?;
+        info!("Embedding model persisted to user cache: {}", dir.display());
+        Ok(())
     }
 
     /// Common path: parse config, tokenizer, and weights bytes into a model.
@@ -214,17 +332,17 @@ impl CandleEmbedder {
 
     /// Select the best available device.
     ///
-    /// Uses CPU by default because Candle's Metal backend does not support
-    /// all operations needed by BERT (e.g. layer-norm). Set the environment
-    /// variable `SPIRE_USE_METAL=1` to enable Metal GPU acceleration (may
-    /// fail on unsupported ops).
+    /// Uses Metal GPU acceleration by default on Apple Silicon (falls back to
+    /// CPU if a Metal device cannot be created). Set `SPIRE_USE_METAL=0` to
+    /// force CPU.
     fn select_device() -> Device {
         #[cfg(target_os = "macos")]
         {
-            if std::env::var("SPIRE_USE_METAL").as_deref() == Ok("1") {
+            let disable = std::env::var("SPIRE_USE_METAL").as_deref() == Ok("0");
+            if !disable {
                 match Device::new_metal(0) {
                     Ok(device) => {
-                        info!("Using Metal GPU acceleration (SPIRE_USE_METAL=1)");
+                        info!("Using Metal GPU acceleration");
                         return device;
                     }
                     Err(e) => {
@@ -232,7 +350,7 @@ impl CandleEmbedder {
                     }
                 }
             }
-            info!("Using CPU (Metal disabled; set SPIRE_USE_METAL=1 to enable)");
+            info!("Using CPU (Metal disabled or unavailable; set SPIRE_USE_METAL=1 to retry)");
             Device::Cpu
         }
         #[cfg(not(target_os = "macos"))]
