@@ -242,6 +242,33 @@ pub fn distance_point_to_geometry(p: &Point<f64>, g: &Geometry<f64>) -> f64 {
     }
 }
 
+/// Approximate minimum great-circle distance between two geometries, in meters.
+///
+/// Returns `0` when the geometries touch or intersect. Otherwise every vertex
+/// of each geometry is projected onto the other geometry (an exact
+/// point-to-line/polygon closest-point computation) and the minimum haversine
+/// distance is returned. This is exact when one geometry is a point, and a
+/// close approximation for line/polygon pairs that do not intersect.
+pub fn distance_between_geometries(a: &Geometry<f64>, b: &Geometry<f64>) -> f64 {
+    if geometries_intersect(a, b) {
+        return 0.0;
+    }
+    let mut best = f64::INFINITY;
+    for c in a.coords_iter() {
+        let d = distance_point_to_geometry(&Point::from(c), b);
+        if d < best {
+            best = d;
+        }
+    }
+    for c in b.coords_iter() {
+        let d = distance_point_to_geometry(&Point::from(c), a);
+        if d < best {
+            best = d;
+        }
+    }
+    best
+}
+
 // ============================================================================
 // Tile projection (Web Mercator / slippy-map)
 // ============================================================================

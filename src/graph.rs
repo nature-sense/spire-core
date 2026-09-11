@@ -168,6 +168,21 @@ impl GraphDb {
         })
     }
 
+    /// Resolve the `uuid` property of the node with the given numeric row id
+    /// (as returned stringified in vector-search hits). Returns `None` if the
+    /// id is stale/tombstoned or the node has no `uuid` property.
+    pub fn node_uuid_by_row_id(&self, node_id: u64) -> Option<String> {
+        let node = self.get_node(NodeId::new(node_id))?;
+        for (k, v) in &node.properties {
+            if k == "uuid" {
+                if let Value::String(s) = v {
+                    return Some(s.to_string());
+                }
+            }
+        }
+        None
+    }
+
     /// Delete a node by its ID.
     pub fn delete_node(&self, node_id: NodeId) -> Result<()> {
         let mut txn = self.shared.begin_write();

@@ -25,11 +25,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
+use geo::BoundingRect;
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use selene_db_core::value::Value;
 use selene_db_core::vector::VectorMetric;
+use selene_db_graph::VectorIndexKind;
 
 use spire_actor::Actor;
 
@@ -111,6 +113,15 @@ pub enum MemoryGraphMessage {
     /// Initialize the graph database with the given data directory.
     /// Creates the GraphDb instance and rebuilds the UUID cache.
     Initialize {
+        data_dir: PathBuf,
+        reply_to: tokio::sync::oneshot::Sender<Result<()>>,
+    },
+    /// Initialize the graph for a bulk-import store: fresh stores (no existing
+    /// snapshot) get a WAL-less in-memory graph whose writes avoid per-op WAL
+    /// fsync (order-of-magnitude faster for 15k+ feature imports, durable via
+    /// explicit `Sync` snapshots); stores that already have a snapshot are
+    /// recovered normally so previously imported data loads on restart.
+    InitializeInMemory {
         data_dir: PathBuf,
         reply_to: tokio::sync::oneshot::Sender<Result<()>>,
     },
@@ -202,6 +213,36 @@ pub enum MemoryGraphMessage {
         query: String,
         limit: Option<usize>,
         reply_to: tokio::sync::oneshot::Sender<Result<Vec<MemoryEntry>>>,
+    },
+    /// Batch-embed texts with the initialized embedder (used by importers to
+    /// attach embeddings to the nodes they store).
+    EmbedTexts {
+        texts: Vec<String>,
+        reply_to: tokio::sync::oneshot::Sender<Result<Vec<Vec<f32>>>>,
+    },
+    /// Attach an embedding vector to an already-stored node (backfill for data
+    /// imported before embeddings were enabled).
+    SetNodeEmbedding {
+        id: String,
+        vector: Vec<f32>,
+        reply_to: tokio::sync::oneshot::Sender<Result<()>>,
+    },
+    /// Batched form of [`SetNodeEmbedding`] — one message updates many nodes,
+    /// which is far cheaper than one actor round-trip per node during backfill.
+    SetNodeEmbeddings {
+        items: Vec<(String, Vec<f32>)>,
+        reply_to: tokio::sync::oneshot::Sender<Result<()>>,
+    },
+    /// Rebuild the vector search indexes (required after bulk `SET` of the
+    /// `embedding` property so `exact_vector_search` can see the values).
+    RebuildVectorIndexes {
+        reply_to: tokio::sync::oneshot::Sender<Result<()>>,
+    },
+    /// Ensure a durable (label, property) vector index exists for node
+    /// embeddings (SpireNode.embedding @ 384-d). Registering the index makes
+    /// Selene store numeric-list `SET`s as typed vectors.
+    EnsureEmbeddingVectorIndex {
+        reply_to: tokio::sync::oneshot::Sender<Result<()>>,
     },
 
     // ── Spatial Queries ─────────────────────────────────
@@ -416,6 +457,31 @@ impl MemoryGraphActor {
         Ok(())
     }
 
+    /// Initialize a WAL-less in-memory graph bound to `data_dir` for snapshot
+    /// persistence. Writes are pure in-memory (no per-op WAL fsync) — an order
+    /// of magnitude faster for bulk imports; durability comes from explicit
+    /// `Sync` snapshots.
+    fn init_graph_in_memory(&mut self, data_dir: &PathBuf) -> Result<()> {
+        let graph_db = Arc::new(
+            GraphDb::new_in_memory()
+                .map_err(|e| anyhow::anyhow!("Failed to create in-memory graph: {e}"))?,
+        );
+
+        self.graph_db = Some(graph_db.clone());
+        self.data_dir = Some(data_dir.clone());
+
+        let (new_tx, snapshot_rx) = mpsc::unbounded_channel::<()>();
+        self.snapshot_tx = Some(new_tx);
+        let handle = Self::spawn_snapshot_task(data_dir.clone(), graph_db, snapshot_rx);
+        self.snapshot_task_handle = Some(handle);
+
+        info!(
+            "MemoryGraph: in-memory graph initialized (snapshots at: {})",
+            data_dir.display()
+        );
+        Ok(())
+    }
+
     /// Initialize the embedding model.
     fn init_embedder(
         &mut self,
@@ -439,6 +505,15 @@ impl MemoryGraphActor {
     /// Escape a string value for use in a GQL literal (single-quoted).
     fn gql_escape(s: &str) -> String {
         s.replace('\\', "\\\\").replace('\'', "\\'")
+    }
+
+    /// Parse the bare numeric row id out of a vector-search hit id, which
+    /// Selene stringifies as `NodeId(<n>)`.
+    fn vector_hit_row_id(hit_id: &str) -> Option<u64> {
+        hit_id
+            .strip_prefix("NodeId(")
+            .and_then(|s| s.strip_suffix(')'))
+            .and_then(|s| s.parse().ok())
     }
 
     /// Build a GQL property map string from a list of (key, value) pairs.
@@ -1313,23 +1388,22 @@ impl MemoryGraphActor {
 
         let mut scored_nodes = Vec::new();
         for hit in &hits {
-            let gql = format!("MATCH (n) WHERE id(n) = {} RETURN n.uuid", hit.0);
-            if let Ok(table) = graph_db.execute_gql_query(&gql) {
-                if let Some(row) = table.rows().first() {
-                    if let Some(uuid_idx) = table.column_index(crate::graph::to_db_string("n.uuid"))
-                    {
-                        if let Some(Value::String(uuid)) = row.get(uuid_idx) {
-                            if let Some(node) = self.query_attr_node_by_uuid(uuid.as_ref()) {
-                                scored_nodes.push(ScoredNode {
-                                    node,
-                                    similarity: hit.1,
-                                    source: RetrievalSource::Semantic,
-                                    score: hit.1,
-                                });
-                            }
-                        }
-                    }
-                }
+            // `exact_vector_search_nodes` stringifies the hit id as
+            // `NodeId(<n>)`; resolve that row id to the node's `uuid` via the
+            // graph directly (GQL `id(n)` comparisons were unreliable here).
+            let Some(row_id) = Self::vector_hit_row_id(&hit.0) else {
+                continue;
+            };
+            let Some(uuid) = graph_db.node_uuid_by_row_id(row_id) else {
+                continue;
+            };
+            if let Some(node) = self.query_attr_node_by_uuid(&uuid) {
+                scored_nodes.push(ScoredNode {
+                    node,
+                    similarity: hit.1,
+                    source: RetrievalSource::Semantic,
+                    score: hit.1,
+                });
             }
         }
 
@@ -1415,31 +1489,33 @@ impl MemoryGraphActor {
 
         let mut entries = Vec::new();
         for hit in &hits {
-            let gql = format!("MATCH (n) WHERE id(n) = {} RETURN n", hit.0);
-            if let Ok(table) = graph_db.execute_gql_query(&gql) {
-                if let Some(row) = table.rows().first() {
-                    if let Some(node) = Self::attr_node_from_ref_row(row, &table, graph_db) {
-                        let default_metadata = MemoryMetadata {
-                            mem_type: None,
-                            tags: None,
-                            source: None,
-                            confidence: None,
-                        };
-                        let node_id = node.id().to_string();
-                        entries.push(MemoryEntry {
-                            id: node_id,
-                            text: node
-                                .description()
-                                .map(|s| s.to_string())
-                                .unwrap_or_else(|| node.name().to_string()),
-                            metadata: default_metadata,
-                            embedding_id: node.embedding_id().unwrap_or("").to_string(),
-                            node_id: Some(node.id().to_string()),
-                            created_at: node.created_at(),
-                            updated_at: node.updated_at(),
-                        });
-                    }
-                }
+            // See `handle_search_context`: hit ids come back as `NodeId(<n>)`.
+            let Some(row_id) = Self::vector_hit_row_id(&hit.0) else {
+                continue;
+            };
+            let Some(uuid) = graph_db.node_uuid_by_row_id(row_id) else {
+                continue;
+            };
+            if let Some(node) = self.query_attr_node_by_uuid(&uuid) {
+                let default_metadata = MemoryMetadata {
+                    mem_type: None,
+                    tags: None,
+                    source: None,
+                    confidence: None,
+                };
+                let node_id = node.id().to_string();
+                entries.push(MemoryEntry {
+                    id: node_id,
+                    text: node
+                        .description()
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| node.name().to_string()),
+                    metadata: default_metadata,
+                    embedding_id: node.embedding_id().unwrap_or("").to_string(),
+                    node_id: Some(node.id().to_string()),
+                    created_at: node.created_at(),
+                    updated_at: node.updated_at(),
+                });
             }
         }
 
@@ -1483,6 +1559,11 @@ impl MemoryGraphActor {
             SpatialQuery::Intersects { geometry } => {
                 self.spatial_intersects(geometry, node_type, subtype, limit)
             }
+            SpatialQuery::WithinDistanceOf {
+                reference,
+                target,
+                radius_meters,
+            } => self.spatial_within_distance_of(reference, target, *radius_meters, limit),
         }
     }
 
@@ -1567,6 +1648,134 @@ impl MemoryGraphActor {
             return Some(g);
         }
         attr.geo_point().map(geo::Geometry::Point)
+    }
+
+    /// Fetch the `Feature` nodes selected by a [`FeatureSpec`] (union of the
+    /// layer `subtype` matches and the `FOLDERPATH` class matches).
+    fn fetch_feature_nodes_by_spec(&self, spec: &crate::models::memory_graph::FeatureSpec) -> Vec<AttrNode> {
+        let graph_db = match self.graph_db.as_ref() {
+            Some(db) => db,
+            None => return Vec::new(),
+        };
+        let mut conds: Vec<String> = Vec::new();
+        for l in &spec.layers {
+            conds.push(format!(
+                "n.{pnt} = 'Feature' AND n.{ps} = '{lv}'",
+                pnt = PROP_NODE_TYPE,
+                ps = PROP_SUBTYPE,
+                lv = Self::gql_escape(l)
+            ));
+        }
+        for c in &spec.classes {
+            conds.push(format!(
+                "n.{pnt} = 'Feature' AND n.FOLDERPATH = '{cv}'",
+                pnt = PROP_NODE_TYPE,
+                cv = Self::gql_escape(c)
+            ));
+        }
+
+        let mut out: Vec<AttrNode> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for cond in conds {
+            let gql = format!("MATCH (n:{}) WHERE {} RETURN n", LABEL_SPIRE_NODE, cond);
+            if let Ok(table) = graph_db.execute_gql_query(&gql) {
+                for row in table.rows() {
+                    if let Some(attr) = Self::attr_node_from_ref_row(row, &table, graph_db) {
+                        if seen.insert(attr.id.clone()) {
+                            out.push(attr);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Spatial join: every **target** feature whose geometry lies within
+    /// `radius_meters` of any **reference** feature, sorted by distance.
+    ///
+    /// Candidates are cheaply pruned with an inflated union bbox of the
+    /// reference geometries before the exact per-pair geometry distances run.
+    fn spatial_within_distance_of(
+        &self,
+        reference: &crate::models::memory_graph::FeatureSpec,
+        target: &crate::models::memory_graph::FeatureSpec,
+        radius_meters: f64,
+        limit: Option<usize>,
+    ) -> Result<SpatialQueryResult> {
+        let empty = SpatialQueryResult {
+            nodes: Vec::new(),
+            total_results: 0,
+            truncated: false,
+        };
+        if reference.is_empty() || target.is_empty() {
+            return Ok(empty);
+        }
+
+        let refs = self.fetch_feature_nodes_by_spec(reference);
+        let targets = self.fetch_feature_nodes_by_spec(target);
+        if refs.is_empty() || targets.is_empty() {
+            return Ok(empty);
+        }
+
+        let ref_geoms: Vec<geo::Geometry<f64>> =
+            refs.iter().filter_map(Self::node_geometry).collect();
+        if ref_geoms.is_empty() {
+            return Ok(empty);
+        }
+
+        // Union bbox of the reference geometries, inflated by `radius`.
+        let mut union_rect: Option<geo::Rect<f64>> = None;
+        for g in &ref_geoms {
+            if let Some(r) = g.bounding_rect() {
+                union_rect = Some(match union_rect {
+                    None => r,
+                    Some(u) => geo::Rect::new(
+                        geo::Coord {
+                            x: u.min().x.min(r.min().x),
+                            y: u.min().y.min(r.min().y),
+                        },
+                        geo::Coord {
+                            x: u.max().x.max(r.max().x),
+                            y: u.max().y.max(r.max().y),
+                        },
+                    ),
+                });
+            }
+        }
+        let Some(u) = union_rect else { return Ok(empty) };
+
+        // ~meters-per-degree latitude; slightly conservative on longitude.
+        let inflate = radius_meters / 111_132.0;
+        let window = geo::Rect::new(
+            geo::Coord { x: u.min().x - inflate, y: u.min().y - inflate },
+            geo::Coord { x: u.max().x + inflate, y: u.max().y + inflate },
+        );
+
+        let mut scored: Vec<DistanceScoredNode> = Vec::new();
+        for t in &targets {
+            let Some(tg) = Self::node_geometry(t) else { continue };
+            if let Some(tr) = tg.bounding_rect() {
+                if !crate::spatial::rects_intersect(&tr, &window) {
+                    continue;
+                }
+            }
+            let mut best = f64::INFINITY;
+            for rg in &ref_geoms {
+                let d = crate::spatial::distance_between_geometries(&tg, rg);
+                if d < best {
+                    best = d;
+                }
+            }
+            if best <= radius_meters {
+                scored.push(DistanceScoredNode {
+                    node: t.clone(),
+                    distance_meters: Some(best),
+                });
+            }
+        }
+
+        Ok(self.spatial_result(scored, limit, true))
     }
 
     /// Great-circle distance from `center` to a node's geometry — `0` when the
@@ -1806,16 +2015,23 @@ impl MemoryGraphActor {
         let gql = format!("INSERT (n:{} {})", LABEL_SPIRE_NODE, props_str);
         graph_db.execute_gql_write(&gql)?;
 
-        // Step 2: SET each envelope property individually (the open `AttrNode`
-        // envelope carries every domain field — typed or dynamic — in one map).
-        for (key, val) in &attr.properties {
+        // Step 2: SET all envelope properties in ONE statement. GQL accepts
+        // comma-separated assignments after `SET`; running one write per
+        // property meant ~10-11 GQL sessions per node, which made bulk imports
+        // of 15k+ nodes take ~10 minutes of CPU (each node carried ~10 dynamic
+        // properties such as geometry/layer_id/OBJECTID).
+        if !attr.properties.is_empty() {
+            let set_parts: Vec<String> = attr
+                .properties
+                .iter()
+                .map(|(key, val)| format!("n.{} = {}", key, Self::format_value_as_gql(val)))
+                .collect();
             let set_gql = format!(
-                "MATCH (n:{}) WHERE n.{} = '{}' SET n.{} = {}",
+                "MATCH (n:{}) WHERE n.{} = '{}' SET {}",
                 LABEL_SPIRE_NODE,
                 PROP_UUID,
                 Self::gql_escape(attr.id()),
-                key,
-                Self::format_value_as_gql(val),
+                set_parts.join(", ")
             );
             graph_db.execute_gql_write(&set_gql)?;
         }
@@ -2065,6 +2281,21 @@ impl Actor for MemoryGraphActor {
         match msg {
             MemoryGraphMessage::Initialize { data_dir, reply_to } => {
                 let result = self.init_graph(&data_dir);
+                let _ = reply_to.send(result);
+            }
+            MemoryGraphMessage::InitializeInMemory { data_dir, reply_to } => {
+                // Fresh store → WAL-less in-memory graph (fast bulk imports,
+                // persisted by `Sync`). Store with an existing snapshot →
+                // recover it so restarts reload previously imported data.
+                let has_snapshot = GraphDb::latest_snapshot_sequence(&data_dir)
+                    .map(|s| s.is_some())
+                    .unwrap_or(false);
+                let result = if has_snapshot {
+                    info!("MemoryGraph: snapshot found, recovering store");
+                    self.init_graph(&data_dir)
+                } else {
+                    self.init_graph_in_memory(&data_dir)
+                };
                 let _ = reply_to.send(result);
             }
             MemoryGraphMessage::InitializeEmbedder {
@@ -2426,6 +2657,93 @@ impl Actor for MemoryGraphActor {
                 reply_to,
             } => {
                 let result = self.handle_recall(query, limit).await;
+                let _ = reply_to.send(result);
+            }
+            MemoryGraphMessage::EmbedTexts { texts, reply_to } => {
+                let result = (|| async {
+                    let embedder = self
+                        .embedder
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("Embedder not initialized"))?;
+                    let embs = embedder.embed_batch(&texts).await?;
+                    Ok(embs.into_iter().map(|e| e.vector).collect::<Vec<Vec<f32>>>())
+                })()
+                .await;
+                let _ = reply_to.send(result);
+            }
+            MemoryGraphMessage::EnsureEmbeddingVectorIndex { reply_to } => {
+                let result = (|| -> Result<()> {
+                    let graph_db = self
+                        .graph_db
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("GraphDb not initialized"))?;
+                    match graph_db.create_vector_index(
+                        LABEL_SPIRE_NODE,
+                        "embedding",
+                        384,
+                        VectorIndexKind::Flat,
+                    ) {
+                        Ok(()) => Ok(()),
+                        Err(e) if e.to_string().contains("already exists") => Ok(()),
+                        Err(e) if e.to_string().contains("is not a vector") => Ok(()),
+                        Err(e) => Err(e),
+                    }
+                })();
+                let _ = reply_to.send(result);
+            }
+            MemoryGraphMessage::RebuildVectorIndexes { reply_to } => {
+                let result = (|| -> Result<()> {
+                    let graph_db = self
+                        .graph_db
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("GraphDb not initialized"))?;
+                    graph_db.rebuild_vector_indexes()?;
+                    Ok(())
+                })();
+                let _ = reply_to.send(result);
+            }
+            MemoryGraphMessage::SetNodeEmbeddings { items, reply_to } => {
+                let result = (|| -> Result<()> {
+                    let graph_db = self
+                        .graph_db
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("GraphDb not initialized"))?;
+                    for (id, vector) in items {
+                        let vec_str: String = vector
+                            .iter()
+                            .map(|v| v.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let gql = format!(
+                            "MATCH (n) WHERE n.uuid = '{}' SET n.embedding = CAST([{}] AS VECTOR)",
+                            Self::gql_escape(&id),
+                            vec_str
+                        );
+                        graph_db.execute_gql_write(&gql)?;
+                    }
+                    Ok(())
+                })();
+                let _ = reply_to.send(result);
+            }
+            MemoryGraphMessage::SetNodeEmbedding { id, vector, reply_to } => {
+                let result = (|| -> Result<()> {
+                    let graph_db = self
+                        .graph_db
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("GraphDb not initialized"))?;
+                    let vec_str: String = vector
+                        .iter()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let gql = format!(
+                        "MATCH (n) WHERE n.uuid = '{}' SET n.embedding = CAST([{}] AS VECTOR)",
+                        Self::gql_escape(&id),
+                        vec_str
+                    );
+                    graph_db.execute_gql_write(&gql)?;
+                    Ok(())
+                })();
                 let _ = reply_to.send(result);
             }
             MemoryGraphMessage::SpatialQuery {
@@ -2877,12 +3195,28 @@ impl Actor for MemoryGraphActor {
                         .as_ref()
                         .ok_or_else(|| anyhow::anyhow!("GraphDb not initialized"))?;
 
-                    let next_seq = match GraphDb::latest_snapshot_sequence(data_dir)? {
-                        Some(seq) => seq + 1,
-                        None => 1,
-                    };
-
-                    let outcome = graph_db.write_snapshot(data_dir, next_seq, true)?;
+                    // The debounced background snapshot task can be writing the
+                    // same next sequence concurrently; on "file exists" wait for
+                    // it to finish, then recompute and retry once.
+                    let mut outcome = None;
+                    for attempt in 0..2 {
+                        let next_seq = match GraphDb::latest_snapshot_sequence(data_dir)? {
+                            Some(seq) => seq + 1,
+                            None => 1,
+                        };
+                        match graph_db.write_snapshot(data_dir, next_seq, true) {
+                            Ok(o) => {
+                                outcome = Some(o);
+                                break;
+                            }
+                            Err(e) if attempt == 0 => {
+                                info!("MemoryGraph: snapshot race ({}), retrying", e);
+                                std::thread::sleep(std::time::Duration::from_millis(1500));
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    let outcome = outcome.expect("retry loop returned without outcome");
                     info!(
                         "MemoryGraph: snapshot written (seq={}, sections={})",
                         outcome.snapshot_seq, outcome.section_count

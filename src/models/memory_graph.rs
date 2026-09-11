@@ -556,6 +556,32 @@ pub enum SpatialQuery {
     Contains { geometry: geo::Geometry<f64> },
     /// All nodes whose geometry shares any point with `geometry`.
     Intersects { geometry: geo::Geometry<f64> },
+    /// All **target** features within `radius_meters` of any **reference**
+    /// feature (a spatial join over the two feature sets). Targets are
+    /// returned sorted by ascending distance with `distance_meters` set.
+    WithinDistanceOf {
+        reference: FeatureSpec,
+        target: FeatureSpec,
+        radius_meters: f64,
+    },
+}
+
+/// A set of features identified by layer (`subtype`) and/or class
+/// (`FOLDERPATH`) — used to describe the reference and target sides of a
+/// proximity query. An empty filter matches nothing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FeatureSpec {
+    /// Layer machine names (`subtype` on feature nodes).
+    pub layers: Vec<String>,
+    /// Class keys (`FOLDERPATH`, e.g. `Layers/Major_Road`).
+    pub classes: Vec<String>,
+}
+
+impl FeatureSpec {
+    /// True when the spec would select nothing.
+    pub fn is_empty(&self) -> bool {
+        self.layers.is_empty() && self.classes.is_empty()
+    }
 }
 
 /// A single node hit returned by a spatial query. `distance_meters` is set for
