@@ -139,6 +139,7 @@ impl GitModule {
                 let msg = args.get("message").and_then(|v| v.as_str()).unwrap_or("");
                 self.commit(&path, msg).await
             }
+            "git_stage" => self.git_run(&path, &["add", "-A"]).await,
             other => Err(format!("Unknown git tool: {other}")),
         };
         match result {
@@ -186,6 +187,15 @@ impl GitModule {
             crate::actors::ToolInfo {
                 name: "git_branch".to_string(),
                 description: "List local + remote git branches.".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"]
+                }),
+            },
+            crate::actors::ToolInfo {
+                name: "git_stage".to_string(),
+                description: "Stage all working-tree changes (`git add -A`), so a following git_commit includes them.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": { "path": { "type": "string" } },
