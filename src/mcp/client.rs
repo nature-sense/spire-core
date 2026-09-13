@@ -330,7 +330,14 @@ impl McpClientManager {
                 let transport = ClientStreamableTransport::new(
                     &transport_options,
                     None, // session_id
-                    true, // standalone
+                    // NOT standalone. Standalone mode opens a GET SSE stream to
+                    // the MCP URL before any session exists, and `start()` treats
+                    // any status for it as fatal — so every spec-compliant server
+                    // that answers a session-less GET with 400/405 (this is
+                    // allowed; the GET endpoint is optional) would be unusable.
+                    // Session-scoped streams (the POST-paired ones) are what the
+                    // SDK's own client helper uses, and they interoperate.
+                    false,
                 )
                 .map_err(|e| {
                     anyhow::anyhow!(
