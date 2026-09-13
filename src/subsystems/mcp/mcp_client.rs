@@ -14,7 +14,9 @@ use std::time::Instant;
 
 use crate::actors::progress::{ProgressMessage, ProgressStatus, ProgressUpdate};
 use crate::actors::{Actor, ActorError};
-use crate::mcp::client::{BuildSystemInfo, McpClientManager, McpServerConfig};
+use crate::mcp::client::{
+    BuildSystemInfo, McpClientManager, McpServerConfig, CONNECT_TIMEOUT_SECS,
+};
 
 /// Structured detail about an MCP server for the UI.
 #[derive(Debug, Clone, Serialize)]
@@ -164,11 +166,22 @@ impl Actor for McpClientActor {
                 server_name,
                 reply_to,
             } => {
-                let result = self
-                    .manager
-                    .connect(&server_name)
-                    .await
-                    .map_err(|e| ActorError::Internal(format!("Failed to connect: {}", e)));
+                // Bounded on purpose: this actor's mailbox is shared by every
+                // tool call, so a board that is powered off (or firewalled) must
+                // not park it. Same budget as `connect_all`.
+                let result = match tokio::time::timeout(
+                    std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS),
+                    self.manager.connect(&server_name),
+                )
+                .await
+                {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) => Err(ActorError::Internal(format!("Failed to connect: {}", e))),
+                    Err(_) => Err(ActorError::Internal(format!(
+                        "Timed out connecting to '{}' after {}s",
+                        server_name, CONNECT_TIMEOUT_SECS
+                    ))),
+                };
                 let _ = reply_to.send(result);
             }
             McpClientMessage::DisconnectAll { reply_to } => {

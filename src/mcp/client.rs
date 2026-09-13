@@ -89,6 +89,14 @@ fn default_autostart() -> bool {
     true
 }
 
+/// Budget for a single MCP server connection attempt.
+///
+/// Server endpoints can be absent — a powered-off board, a subprocess that
+/// hangs during initialize. A bounded attempt keeps startup, and the client
+/// actor's mailbox (which every tool call shares), from parking on one dead
+/// endpoint.
+pub const CONNECT_TIMEOUT_SECS: u64 = 15;
+
 /// Represents a live connection to an external MCP server.
 struct McpClientConnection {
     config: McpServerConfig,
@@ -200,9 +208,9 @@ impl McpClientManager {
 
     /// Connect to all configured servers.
     ///
-    /// Each server connection has a 15-second timeout. If a server subprocess
-    /// hangs during initialization, it will be skipped so other servers can
-    /// still connect.
+    /// Each server connection has a [`CONNECT_TIMEOUT_SECS`] timeout. If a
+    /// server subprocess hangs during initialization, it will be skipped so
+    /// other servers can still connect.
     pub async fn connect_all(&mut self) {
         let names: Vec<String> = self.connections.keys().cloned().collect();
         for name in names {
@@ -217,7 +225,7 @@ impl McpClientManager {
             }
             let name_clone = name.clone();
             match tokio::time::timeout(
-                std::time::Duration::from_secs(15),
+                std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS),
                 self.connect(&name_clone),
             )
             .await

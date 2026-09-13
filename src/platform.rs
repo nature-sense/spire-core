@@ -116,6 +116,67 @@ impl Platform {
         platforms.into_iter().find(|p| p.id == id)
     }
 
+    /// Graph/MCP name of this platform's device server, e.g. `device-rpi5`.
+    ///
+    /// One stable name per platform keeps the MCP server list (and the tools it
+    /// contributes) greppable. Platforms with no device endpoint have no name.
+    pub fn device_server_name(&self) -> Option<String> {
+        self.device
+            .as_ref()?
+            .has_mcp()
+            .then(|| format!("device-{}", self.id))
+    }
+
+    /// MCP client config for this platform's board, when it declares one.
+    ///
+    /// `autostart: false` on purpose. Boards are frequently powered off, and the
+    /// MCP client's `ConnectAll` blocks for up to 15s per unreachable server —
+    /// so an absent board must never stall startup. The host registers the
+    /// server cheaply and connects it deliberately instead (project open spawns
+    /// a bounded background connect; see the coordinator's `device/` handlers).
+    pub fn device_mcp_config(&self) -> Option<crate::mcp::client::McpServerConfig> {
+        let mcp = self.device.as_ref()?.mcp.as_ref()?;
+        let url = mcp.url.trim();
+        if url.is_empty() {
+            return None;
+        }
+
+        let mut headers = std::collections::HashMap::new();
+        if let Some(token) = mcp
+            .token
+            .as_deref()
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+        {
+            headers.insert("Authorization".to_string(), format!("Bearer {token}"));
+        }
+
+        Some(crate::mcp::client::McpServerConfig {
+            name: self.device_server_name()?,
+            transport: crate::mcp::client::TransportConfig::Http {
+                url: url.to_string(),
+                headers,
+            },
+            autostart: false,
+            build_type: None,
+        })
+    }
+
+    /// Every registered platform that declares a device MCP endpoint
+    /// (`device.mcp.url`), in registry order.
+    pub fn device_platforms() -> Vec<Platform> {
+        Self::device_platforms_in(Self::default_platform_dir())
+    }
+
+    /// Every platform in `dir` that declares a device MCP endpoint.
+    pub fn device_platforms_in(dir: impl AsRef<Path>) -> Vec<Platform> {
+        Self::load_directory(dir)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|platform| platform.device_server_name().is_some())
+            .collect()
+    }
+
     /// Substitute `${SYSROOT}` in a single arg with the sysroot root.
     fn substitute(&self, arg: &str) -> String {
         arg.replace(SYSROOT_TOKEN, &self.sysroot.root)
@@ -347,11 +408,14 @@ mod tests {
         // The sysroot path is machine-specific ("sysroots/a7s" or
         // "/opt/cross/sysroot/cubie-a7s"); assert it references the platform.
         assert!(p.sysroot.root.contains("a7s"), "sysroot must reference a7s");
-        // The SYSROOT token must be substituted when rendering the meson cross file.
+        // The SYSROOT token must be substituted when rendering the meson cross
+        // file. The C++ standard-library version is machine-specific (GCC 10 vs
+        // 12 depending on which sysroot is installed), so assert the
+        // substitution itself rather than a pinned version.
         let cross = p.meson_cross_file().expect("linux cross file");
         assert!(
-            cross.contains(&format!("-I{}/usr/include/c++/12", p.sysroot.root)),
-            "cpp include must substitute the SYSROOT token"
+            cross.contains(&format!("-I{}/usr/include/c++/", p.sysroot.root)),
+            "cpp include must substitute the SYSROOT token: {cross}"
         );
     }
 
@@ -559,6 +623,7 @@ sysroot:
             },
             toolchain: PlatformToolchain::default(),
             sysroot: PlatformSysroot::default(),
+            device: None,
         };
         assert!(platform.meson_cross_file().is_none());
     }
@@ -593,6 +658,7 @@ sysroot:
                 include_dirs: Vec::new(),
                 pkg_config_libdir: Vec::new(),
             },
+            device: None,
         };
         let (ok, reason) = missing.sysroot_ok();
         assert!(!ok, "missing root must be blocked");
@@ -619,6 +685,7 @@ sysroot:
                 include_dirs: Vec::new(),
                 pkg_config_libdir: Vec::new(),
             },
+            device: None,
         };
         let (ok, reason) = placeholder.sysroot_ok();
         assert!(!ok, "empty root must be blocked");
@@ -645,6 +712,7 @@ sysroot:
                 include_dirs: Vec::new(),
                 pkg_config_libdir: Vec::new(),
             },
+            device: None,
         };
         assert!(populated.sysroot_ok().0, "populated root must pass");
 
@@ -663,6 +731,7 @@ sysroot:
             },
             toolchain: PlatformToolchain::default(),
             sysroot: PlatformSysroot::default(),
+            device: None,
         };
         assert!(host.sysroot_ok().0, "host must pass");
     }
@@ -700,5 +769,207 @@ sysroot:
         let platforms = Platform::load_directory(tmp.path()).unwrap();
         assert_eq!(platforms.len(), 1);
         assert_eq!(platforms[0].id, "rpi5");
+    }
+
+    /// A platform's `device:` block is what turns a target into something Spire
+    /// can talk to: an MCP endpoint on the board plus a deploy destination.
+    #[test]
+    fn device_block_maps_to_device_mcp_config() {
+        let platform: Platform = serde_yaml::from_str(
+            r#"
+id: rpi5
+name: Raspberry Pi 5
+os: linux
+architecture:
+  cpu_family: aarch64
+  cpu: armv8-a
+  endian: little
+  target_triple: aarch64-linux-gnu
+toolchain:
+  c: clang
+  cpp: clang++
+  ar: llvm-ar
+  strip: llvm-strip
+sysroot:
+  root: /opt/cross/sysroot/rpi5
+device:
+  mcp:
+    url: http://rpi5.local:8737/mcp
+    token: board-secret
+  deploy:
+    dest: /home/pi/ai-traps
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            platform.device_server_name().as_deref(),
+            Some("device-rpi5")
+        );
+
+        let config = platform.device_mcp_config().expect("device MCP config");
+        assert_eq!(config.name, "device-rpi5");
+        assert!(
+            !config.autostart,
+            "a board must not be contacted by the client's ConnectAll"
+        );
+        match config.transport {
+            crate::mcp::client::TransportConfig::Http { url, headers } => {
+                assert_eq!(url, "http://rpi5.local:8737/mcp");
+                assert_eq!(
+                    headers.get("Authorization").map(String::as_str),
+                    Some("Bearer board-secret")
+                );
+            }
+            other => panic!("expected an HTTP transport, got {other:?}"),
+        }
+
+        let deploy = platform
+            .device
+            .as_ref()
+            .and_then(|device| device.deploy.as_ref())
+            .expect("deploy block");
+        assert_eq!(deploy.dest, "/home/pi/ai-traps");
+    }
+
+    /// A platform with no `device:` is host-only: no server name, no config, and
+    /// no `Authorization` header invented.
+    #[test]
+    fn platform_without_device_has_no_device_config() {
+        let platform: Platform = serde_yaml::from_str(
+            r#"
+id: host
+name: Host
+os: linux
+architecture:
+  cpu_family: x86_64
+  cpu: x86_64
+  endian: little
+  target_triple: x86_64-linux-gnu
+toolchain:
+  c: clang
+  cpp: clang++
+  ar: llvm-ar
+  strip: llvm-strip
+sysroot:
+  root: ""
+"#,
+        )
+        .unwrap();
+
+        assert!(platform.device.is_none());
+        assert_eq!(platform.device_server_name(), None);
+        assert!(platform.device_mcp_config().is_none());
+    }
+
+    /// An endpoint without a token still yields a config — just no auth header —
+    /// and a blank URL is not a device at all.
+    #[test]
+    fn device_config_handles_missing_and_blank_tokens() {
+        // Built by hand (not from the registry) so the test is hermetic.
+        let mut platform = Platform {
+            id: "rpi5".into(),
+            name: "Raspberry Pi 5".into(),
+            os: "linux".into(),
+            architecture: PlatformArchitecture {
+                cpu_family: "aarch64".into(),
+                cpu: "armv8-a".into(),
+                endian: "little".into(),
+                target_triple: "aarch64-linux-gnu".into(),
+                march: None,
+            },
+            toolchain: PlatformToolchain::default(),
+            sysroot: PlatformSysroot::default(),
+            device: None,
+        };
+
+        platform.device = Some(crate::build_types::PlatformDevice {
+            mcp: Some(crate::build_types::PlatformDeviceMcp {
+                url: "http://rock3c.local:8737/mcp".into(),
+                token: Some("   ".into()),
+            }),
+            deploy: None,
+        });
+        let config = platform
+            .device_mcp_config()
+            .expect("blank token still configures");
+        match config.transport {
+            crate::mcp::client::TransportConfig::Http { headers, .. } => {
+                assert!(headers.is_empty(), "blank token must not produce a header");
+            }
+            other => panic!("expected an HTTP transport, got {other:?}"),
+        }
+
+        platform.device = Some(crate::build_types::PlatformDevice {
+            mcp: Some(crate::build_types::PlatformDeviceMcp {
+                url: "  ".into(),
+                token: None,
+            }),
+            deploy: None,
+        });
+        assert_eq!(platform.device_server_name(), None);
+        assert!(platform.device_mcp_config().is_none());
+    }
+
+    /// `device_platforms_in()` is the coordinator's view of the registry: only
+    /// platforms with a board. Takes an explicit directory so the test never
+    /// touches the process-global `SPIRE_PLATFORM_DIR`.
+    #[test]
+    fn device_platforms_filters_the_registry() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_yaml(
+            tmp.path(),
+            "rpi5.yaml",
+            r#"
+id: rpi5
+name: Raspberry Pi 5
+os: linux
+architecture:
+  cpu_family: aarch64
+  cpu: armv8-a
+  endian: little
+  target_triple: aarch64-linux-gnu
+toolchain:
+  c: clang
+  cpp: clang++
+  ar: llvm-ar
+  strip: llvm-strip
+sysroot:
+  root: /opt/cross/sysroot/rpi5
+device:
+  mcp:
+    url: http://rpi5.local:8737/mcp
+"#,
+        );
+        write_yaml(
+            tmp.path(),
+            "host.yaml",
+            r#"
+id: host
+name: Host
+os: linux
+architecture:
+  cpu_family: x86_64
+  cpu: x86_64
+  endian: little
+  target_triple: x86_64-linux-gnu
+toolchain:
+  c: clang
+  cpp: clang++
+  ar: llvm-ar
+  strip: llvm-strip
+sysroot:
+  root: ""
+"#,
+        );
+
+        let devices = Platform::device_platforms_in(tmp.path());
+
+        assert_eq!(devices.len(), 1, "host has no board: {devices:?}");
+        assert_eq!(devices[0].id, "rpi5");
+        assert_eq!(
+            devices[0].device_server_name().as_deref(),
+            Some("device-rpi5")
+        );
     }
 }

@@ -416,6 +416,50 @@ pub struct Platform {
     pub architecture: PlatformArchitecture,
     pub toolchain: PlatformToolchain,
     pub sysroot: PlatformSysroot,
+    /// Optional on-hardware access for this target: the board's MCP endpoint
+    /// (the `spire-target-mcp` server) and where artifacts land on it. Absent
+    /// for host-only targets, which have no board to talk to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<PlatformDevice>,
+}
+
+/// How Spire reaches a board to run things on it (`device:` in the platform
+/// YAML). Every part is optional, so a platform declares only what it has.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PlatformDevice {
+    /// MCP endpoint served by the board.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<PlatformDeviceMcp>,
+    /// Where build artifacts (e.g. test binaries) are deployed on the board.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deploy: Option<PlatformDeploy>,
+}
+
+impl PlatformDevice {
+    /// True when this device declares a usable MCP endpoint.
+    pub fn has_mcp(&self) -> bool {
+        self.mcp
+            .as_ref()
+            .map(|mcp| !mcp.url.trim().is_empty())
+            .unwrap_or(false)
+    }
+}
+
+/// The board's MCP endpoint (`device.mcp`) — a `spire-target-mcp` server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlatformDeviceMcp {
+    /// Streamable HTTP URL, e.g. `http://rpi5.local:8737/mcp`.
+    pub url: String,
+    /// Optional bearer token, sent as `Authorization: Bearer <token>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+}
+
+/// Where artifacts are deployed on the board (`device.deploy`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlatformDeploy {
+    /// Destination directory on the board, e.g. `/home/pi/ai-traps`.
+    pub dest: String,
 }
 
 /// CPU architecture of the target platform.
