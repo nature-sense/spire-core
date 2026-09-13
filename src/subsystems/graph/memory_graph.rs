@@ -39,7 +39,7 @@ use crate::graph::GraphDb;
 use crate::models::embedding::Embedder;
 
 /// Canonical cross-compilation platform definitions cross the crate boundary
-/// as generic JSON (`{ "id", "name", "properties": {flat map} }`); spire-core
+/// as generic JSON (`{ "id", "name", "properties": {flat map} }`); spire-code
 /// owns the typed `Platform` YAML schema + view.
 use crate::models::memory_graph::{
     AttrNode, ContextSearchResult, DistanceScoredNode, GraphEdge, McpConfigFile,
@@ -292,7 +292,7 @@ pub enum MemoryGraphMessage {
         reply_to: tokio::sync::oneshot::Sender<Result<()>>,
     },
     /// Get all platform definitions from the graph as generic JSON nodes
-    /// (`{ "id", "name", "properties": {flat map} }`); spire-core rebuilds its
+    /// (`{ "id", "name", "properties": {flat map} }`); spire-code rebuilds its
     /// typed `Platform` view from the properties.
     GetPlatforms {
         reply_to: tokio::sync::oneshot::Sender<Result<Vec<serde_json::Value>>>,
@@ -1318,9 +1318,7 @@ impl MemoryGraphActor {
 
     /// Serialize a typed `GraphNode::Platform` into the generic JSON shape
     /// `{ "id", "name", "properties": {flat map} }` that crosses the crate
-    /// boundary (spire-core rebuilds its typed `Platform` view from this).
-    /// `{ "id", "name", "properties": {flat map} }` that crosses the crate
-    /// boundary (spire-core rebuilds its typed `Platform` view from this).
+    /// boundary (spire-code rebuilds its typed `Platform` view from this).
     fn platform_node_to_json(node: &AttrNode) -> Option<serde_json::Value> {
         if node.node_type_str() != "Platform" {
             return None;

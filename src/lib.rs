@@ -24,7 +24,6 @@ pub mod graph;
 pub mod mcp;
 pub mod models;
 pub mod modules;
-pub mod platform;
 pub mod spatial;
 pub mod subsystems;
 pub mod tiles;
