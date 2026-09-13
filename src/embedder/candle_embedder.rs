@@ -187,9 +187,7 @@ impl CandleEmbedder {
 
     /// Whether all three model files exist in `dir`.
     fn dir_has_model(dir: &Path) -> bool {
-        MODEL_FILES
-            .iter()
-            .all(|f| dir.join(f).is_file())
+        MODEL_FILES.iter().all(|f| dir.join(f).is_file())
     }
 
     /// Load model files from a local directory.
@@ -265,8 +263,13 @@ impl CandleEmbedder {
         // Persist to the shared user cache so subsequent loads (this app and
         // every other Spire app on the machine) hit disk instead of the network.
         if let Some(cache_dir) = Self::user_cache_dir() {
-            if let Err(e) = Self::persist_bytes(&cache_dir, &config_bytes, &tokenizer_bytes, &weights_bytes) {
-                warn!("Failed to persist model to user cache ({}): {e}", cache_dir.display());
+            if let Err(e) =
+                Self::persist_bytes(&cache_dir, &config_bytes, &tokenizer_bytes, &weights_bytes)
+            {
+                warn!(
+                    "Failed to persist model to user cache ({}): {e}",
+                    cache_dir.display()
+                );
             }
         }
 

@@ -27,16 +27,19 @@ fn main() {
             match embedder.embed_text("Singapore's forested nature reserves and parks") {
                 Ok(vec) => {
                     let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
-                    println!("dims={} norm={:.4} first={} last={}", vec.len(), norm, vec.first().copied().unwrap_or(0.0), vec.last().copied().unwrap_or(0.0));
+                    println!(
+                        "dims={} norm={:.4} first={} last={}",
+                        vec.len(),
+                        norm,
+                        vec.first().copied().unwrap_or(0.0),
+                        vec.last().copied().unwrap_or(0.0)
+                    );
                     if vec.len() != 384 {
                         println!("CACHE-FAIL unexpected dimensions");
                         std::process::exit(1);
                     }
                     let home = std::env::var("HOME").unwrap_or_default();
-                    println!(
-                        "cache: {}/.cache/huggingface/models/all-MiniLM-L6-v2",
-                        home
-                    );
+                    println!("cache: {}/.cache/huggingface/models/all-MiniLM-L6-v2", home);
                     println!("CACHE-OK");
                 }
                 Err(e) => {

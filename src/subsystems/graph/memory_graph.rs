@@ -20,12 +20,12 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use geo::BoundingRect;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use geo::BoundingRect;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -1650,7 +1650,10 @@ impl MemoryGraphActor {
 
     /// Fetch the `Feature` nodes selected by a [`FeatureSpec`] (union of the
     /// layer `subtype` matches and the `FOLDERPATH` class matches).
-    fn fetch_feature_nodes_by_spec(&self, spec: &crate::models::memory_graph::FeatureSpec) -> Vec<AttrNode> {
+    fn fetch_feature_nodes_by_spec(
+        &self,
+        spec: &crate::models::memory_graph::FeatureSpec,
+    ) -> Vec<AttrNode> {
         let graph_db = match self.graph_db.as_ref() {
             Some(db) => db,
             None => return Vec::new(),
@@ -1741,18 +1744,28 @@ impl MemoryGraphActor {
                 });
             }
         }
-        let Some(u) = union_rect else { return Ok(empty) };
+        let Some(u) = union_rect else {
+            return Ok(empty);
+        };
 
         // ~meters-per-degree latitude; slightly conservative on longitude.
         let inflate = radius_meters / 111_132.0;
         let window = geo::Rect::new(
-            geo::Coord { x: u.min().x - inflate, y: u.min().y - inflate },
-            geo::Coord { x: u.max().x + inflate, y: u.max().y + inflate },
+            geo::Coord {
+                x: u.min().x - inflate,
+                y: u.min().y - inflate,
+            },
+            geo::Coord {
+                x: u.max().x + inflate,
+                y: u.max().y + inflate,
+            },
         );
 
         let mut scored: Vec<DistanceScoredNode> = Vec::new();
         for t in &targets {
-            let Some(tg) = Self::node_geometry(t) else { continue };
+            let Some(tg) = Self::node_geometry(t) else {
+                continue;
+            };
             if let Some(tr) = tg.bounding_rect() {
                 if !crate::spatial::rects_intersect(&tr, &window) {
                     continue;
@@ -2664,7 +2677,10 @@ impl Actor for MemoryGraphActor {
                         .clone()
                         .ok_or_else(|| anyhow::anyhow!("Embedder not initialized"))?;
                     let embs = embedder.embed_batch(&texts).await?;
-                    Ok(embs.into_iter().map(|e| e.vector).collect::<Vec<Vec<f32>>>())
+                    Ok(embs
+                        .into_iter()
+                        .map(|e| e.vector)
+                        .collect::<Vec<Vec<f32>>>())
                 })()
                 .await;
                 let _ = reply_to.send(result);
@@ -2723,7 +2739,11 @@ impl Actor for MemoryGraphActor {
                 })();
                 let _ = reply_to.send(result);
             }
-            MemoryGraphMessage::SetNodeEmbedding { id, vector, reply_to } => {
+            MemoryGraphMessage::SetNodeEmbedding {
+                id,
+                vector,
+                reply_to,
+            } => {
                 let result = (|| -> Result<()> {
                     let graph_db = self
                         .graph_db

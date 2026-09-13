@@ -142,9 +142,7 @@ pub enum RagMessage {
     },
     /// Set the UI-selected default domain. `None` clears it. Search tools whose
     /// `domain` is empty resolve against this value inside the actor.
-    SetDefaultDomain {
-        domain: Option<String>,
-    },
+    SetDefaultDomain { domain: Option<String> },
 }
 
 // ============================================================================
