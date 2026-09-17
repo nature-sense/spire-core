@@ -195,17 +195,30 @@ pub enum ProjectStructure {
     /// with `spire-actor` + `spire-core` as sibling path dependencies. Host
     /// (macOS) only.
     SpireApp,
+    /// Embedded HAL: a Cargo workspace holding one **contract** crate (the traits a firmware
+    /// project programs against) plus one **backend** crate per board family, and the executors
+    /// between them. The Rust analogue of [`ProjectStructure::Hal`] — contract + per-platform
+    /// implementations — for firmware rather than a C++ HAL: the contract is a set of `trait`s,
+    /// an implementation is an `impl` in a backend crate, and the wiring is Cargo rather than
+    /// Meson.
+    ///
+    /// Recognized by a **declaration**, not a layout guess: the workspace manifest carries
+    /// `[workspace.metadata.spire] structure = "embedded_hal"`. A layout that happens to look
+    /// like this one is not this project type, and the layout is a consequence of the structure
+    /// rather than its definition.
+    EmbeddedHal,
 }
 
 impl ProjectStructure {
-    /// Stable snake_case key ("native" | "single_source" | "hal" | "spire_app"),
-    /// matching `#[serde(rename_all = "snake_case")]`.
+    /// Stable snake_case key ("native" | "single_source" | "hal" | "spire_app" |
+    /// "embedded_hal"), matching `#[serde(rename_all = "snake_case")]`.
     pub fn as_str(&self) -> &'static str {
         match self {
             ProjectStructure::Native => "native",
             ProjectStructure::SingleSource => "single_source",
             ProjectStructure::Hal => "hal",
             ProjectStructure::SpireApp => "spire_app",
+            ProjectStructure::EmbeddedHal => "embedded_hal",
         }
     }
 
@@ -216,6 +229,7 @@ impl ProjectStructure {
             "single_source" => ProjectStructure::SingleSource,
             "hal" => ProjectStructure::Hal,
             "spire_app" => ProjectStructure::SpireApp,
+            "embedded_hal" => ProjectStructure::EmbeddedHal,
             _ => ProjectStructure::Native,
         }
     }
@@ -444,7 +458,13 @@ mod tests {
 
     #[test]
     fn project_structure_keys_roundtrip() {
-        for key in ["native", "single_source", "hal", "spire_app"] {
+        for key in [
+            "native",
+            "single_source",
+            "hal",
+            "spire_app",
+            "embedded_hal",
+        ] {
             assert_eq!(ProjectStructure::from_str(key).as_str(), key);
         }
         assert_eq!(ProjectStructure::from_str(""), ProjectStructure::Native);
