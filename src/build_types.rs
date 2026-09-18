@@ -207,11 +207,25 @@ pub enum ProjectStructure {
     /// like this one is not this project type, and the layout is a consequence of the structure
     /// rather than its definition.
     EmbeddedHal,
+    /// Embedded **application**: a Rust binary that runs on one board and *depends on* an
+    /// [`ProjectStructure::EmbeddedHal`] project.
+    ///
+    /// A structure of its own rather than a flag on `EmbeddedHal`, because the two are separate
+    /// **projects**: the HAL is a library (a contract plus one backend per board family), and the
+    /// application is a `main` whose `Cargo.toml` path-deps that library's contract crate and the
+    /// chosen board's backend crate — the `blink-esp32 → spire-hal` relationship, generated instead
+    /// of hand-written. The HAL is not a flag because a project cannot be both: an app is a crate,
+    /// the HAL is a workspace, and an app is built *against* one rather than containing it.
+    ///
+    /// Recognized by a declaration too, and for the same reason: `[package.metadata.spire]` carries
+    /// `structure = "embedded_app"` **and** the `hal_path` it depends on, so the dependency is a
+    /// recorded fact rather than something a later reader has to infer from `../` in a path.
+    EmbeddedApp,
 }
 
 impl ProjectStructure {
     /// Stable snake_case key ("native" | "single_source" | "hal" | "spire_app" |
-    /// "embedded_hal"), matching `#[serde(rename_all = "snake_case")]`.
+    /// "embedded_hal" | "embedded_app"), matching `#[serde(rename_all = "snake_case")]`.
     pub fn as_str(&self) -> &'static str {
         match self {
             ProjectStructure::Native => "native",
@@ -219,6 +233,7 @@ impl ProjectStructure {
             ProjectStructure::Hal => "hal",
             ProjectStructure::SpireApp => "spire_app",
             ProjectStructure::EmbeddedHal => "embedded_hal",
+            ProjectStructure::EmbeddedApp => "embedded_app",
         }
     }
 
@@ -230,6 +245,7 @@ impl ProjectStructure {
             "hal" => ProjectStructure::Hal,
             "spire_app" => ProjectStructure::SpireApp,
             "embedded_hal" => ProjectStructure::EmbeddedHal,
+            "embedded_app" => ProjectStructure::EmbeddedApp,
             _ => ProjectStructure::Native,
         }
     }
