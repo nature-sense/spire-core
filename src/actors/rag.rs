@@ -455,6 +455,14 @@ impl RagActor {
 /// Re-embeds the candidate chunk texts with the shared embedder and scores
 /// each with **cosine similarity**. When the embedder returns zero vectors
 /// (the no-op fallback), scores fall back to lexical Jaccard.
+/// How many chunks one query embeds and scores.
+///
+/// Scoring re-embeds every candidate: a chunk records its `embedding_id` (a text hash) but not its
+/// vector, and the `Embedder` trait has no lookup-by-hash, so this is a **latency budget**. It is not a
+/// relevance knob — before the query was scoped by domain, this number was silently deciding *which
+/// corpus* a search could see at all.
+const MAX_SCORED_CHUNKS: usize = 500;
+
 async fn semantic_retrieve(
     memory_graph_tx: &mpsc::Sender<MemoryGraphMessage>,
     embedder: &std::sync::Arc<dyn Embedder>,
@@ -465,13 +473,20 @@ async fn semantic_retrieve(
 ) -> Result<Vec<RagChunkResult>> {
     let q_emb = embedder.embed(query).await?;
 
+    // The domain's chunks, fetched as such.
+    //
+    // This used to read a store-wide slice of 500 chunks and drop the other domains in-process. That
+    // is fine while a store holds one corpus, and it fails silently once it holds several: with
+    // ~19,800 chunks from other corpora in the KnowledgeStore, a freshly ingested 37-chunk corpus
+    // never appeared in the slice, so every query scoped to it came back empty — `ListDomains` counted
+    // its chunks, and search could not see one of them. Scoping the *query* by domain is what makes a
+    // small corpus reachable next to a big one.
     let (tx, rx) = oneshot::channel();
     memory_graph_tx
-        .send(MemoryGraphMessage::QueryAttrNodes {
-            node_type: Some("Unknown".to_string()),
+        .send(MemoryGraphMessage::QueryAttrNodesWhere {
             subtype: Some("rag_chunk".to_string()),
-            name: None,
-            limit: Some(500),
+            props: vec![("domain".to_string(), domain.to_string())],
+            limit: Some(MAX_SCORED_CHUNKS as u32),
             reply_to: tx,
         })
         .await?;
@@ -480,20 +495,18 @@ async fn semantic_retrieve(
     let mut texts: Vec<String> = Vec::new();
     let mut meta: Vec<(String, u32)> = Vec::new(); // (source_path, chunk_index)
     for n in &nodes {
-        if n.get("domain").and_then(|v| v.as_str()) == Some(domain) {
-            if let Some(st) = source_type_filter {
-                if n.get("source_type").and_then(|v| v.as_str()) != Some(st) {
-                    continue;
-                }
+        if let Some(st) = source_type_filter {
+            if n.get("source_type").and_then(|v| v.as_str()) != Some(st) {
+                continue;
             }
-            if let (Some(text), Some(source_path), Some(chunk_index)) = (
-                n.get("text").and_then(|v| v.as_str()),
-                n.get("source_path").and_then(|v| v.as_str()),
-                n.get("chunk_index").and_then(|v| v.as_u64()),
-            ) {
-                texts.push(text.to_string());
-                meta.push((source_path.to_string(), chunk_index as u32));
-            }
+        }
+        if let (Some(text), Some(source_path), Some(chunk_index)) = (
+            n.get("text").and_then(|v| v.as_str()),
+            n.get("source_path").and_then(|v| v.as_str()),
+            n.get("chunk_index").and_then(|v| v.as_u64()),
+        ) {
+            texts.push(text.to_string());
+            meta.push((source_path.to_string(), chunk_index as u32));
         }
     }
     if texts.is_empty() {

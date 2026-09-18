@@ -508,7 +508,15 @@ fn name_guard_is(_path: &str, _pattern: &str) -> bool {
     false
 }
 
-fn path_matches(path: &Path, source: &IngestSource) -> bool {
+/// Decide whether one file in a source's tree belongs to the source, using
+/// `include_files` / `include_paths` / `exclude_paths`.
+///
+/// Public because it is a pure predicate over (path, manifest) and the manifests
+/// live in other crates: a corpus that ingests a fraction of its tree looks
+/// exactly like a corpus that ingested all of it, so the pattern semantics want to
+/// be testable where the patterns are written. See `glob_to_regex` for why a `**`
+/// *followed by another segment* requires a directory at that position.
+pub fn path_matches(path: &Path, source: &IngestSource) -> bool {
     let rel = path.to_string_lossy().to_string();
     // include_files / include_paths / exclude_paths globs may be written as
     // bare file names ("sun55i-a523.dtsi") while `path` is a full absolute

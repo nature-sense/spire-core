@@ -164,6 +164,23 @@ pub enum MemoryGraphMessage {
         limit: Option<u32>,
         reply_to: tokio::sync::oneshot::Sender<Result<Vec<AttrNode>>>,
     },
+    /// Query nodes by subtype **and arbitrary scalar property equalities**, e.g.
+    /// `[("domain", "esp-rs-book")]`.
+    ///
+    /// `QueryAttrNodes` can only filter on node_type / subtype / name, so a caller that needs "this
+    /// domain's chunks" had to read a store-wide slice and drop the other domains in-process. That
+    /// works for one corpus and fails quietly for several: a 37-chunk corpus in a 19,799-chunk store
+    /// never appeared in the slice, so every query scoped to it returned nothing while `ListDomains`
+    /// counted its chunks. Filtering in the graph costs one `WHERE` clause and returns only the rows
+    /// the caller can use.
+    QueryAttrNodesWhere {
+        subtype: Option<String>,
+        /// `(property, value)` equality pairs, ANDed. Values are compared as
+        /// stored strings, so pass the same text the node was written with.
+        props: Vec<(String, String)>,
+        limit: Option<u32>,
+        reply_to: tokio::sync::oneshot::Sender<Result<Vec<AttrNode>>>,
+    },
     UpdateNode {
         id: String,
         updates: NodeUpdate,
@@ -2378,6 +2395,52 @@ impl Actor for MemoryGraphActor {
                     }
                     if let Some(nm) = &name {
                         conditions.push(format!("n.{} = '{}'", PROP_NAME, Self::gql_escape(nm)));
+                    }
+                    let where_clause = if conditions.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" WHERE {}", conditions.join(" AND "))
+                    };
+                    let limit_clause = limit.map(|l| format!(" LIMIT {}", l)).unwrap_or_default();
+                    let gql = format!(
+                        "MATCH (n:{}){} RETURN n{}",
+                        LABEL_SPIRE_NODE, where_clause, limit_clause,
+                    );
+                    let table = graph_db.execute_gql_query(&gql)?;
+                    let mut out = Vec::new();
+                    for row in table.rows() {
+                        if let Some(n_idx) = table.column_index(crate::graph::to_db_string("n")) {
+                            if let Some(selene_db_core::value::Value::NodeRef(nid)) = row.get(n_idx)
+                            {
+                                if let Ok(props) = graph_db.resolve_node_properties(*nid) {
+                                    if let Some(attr) = Self::attr_node_from_resolved(&props) {
+                                        out.push(attr);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(out)
+                })();
+                let _ = reply_to.send(result);
+            }
+            MemoryGraphMessage::QueryAttrNodesWhere {
+                subtype,
+                props,
+                limit,
+                reply_to,
+            } => {
+                let result = (|| -> Result<Vec<AttrNode>> {
+                    let graph_db = self
+                        .graph_db
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("GraphDb not initialized"))?;
+                    let mut conditions: Vec<String> = Vec::new();
+                    if let Some(st) = &subtype {
+                        conditions.push(format!("n.{} = '{}'", PROP_SUBTYPE, Self::gql_escape(st)));
+                    }
+                    for (key, value) in &props {
+                        conditions.push(format!("n.{} = '{}'", key, Self::gql_escape(value)));
                     }
                     let where_clause = if conditions.is_empty() {
                         String::new()
