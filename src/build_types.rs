@@ -477,13 +477,7 @@ mod tests {
 
     #[test]
     fn project_structure_keys_roundtrip() {
-        for key in [
-            "native",
-            "single_source",
-            "hal",
-            "spire_app",
-            "embedded",
-        ] {
+        for key in ["native", "single_source", "hal", "spire_app", "embedded"] {
             assert_eq!(ProjectStructure::from_str(key).as_str(), key);
         }
         assert_eq!(ProjectStructure::from_str(""), ProjectStructure::Native);
