@@ -3049,6 +3049,63 @@ impl Actor for MemoryGraphActor {
                         };
                         actor.store_attr_node_via_gql(&attr, None)?;
                     }
+
+                    // The **capability** nodes and edges, from the flattened blocks spire-code
+                    // attaches as `capability_blocks` (see this message's doc). Deleted first, for the
+                    // same reason the platform nodes are: the graph has to mirror the registry, and a
+                    // board whose old capabilities survived would be verified against a graph that no
+                    // longer matches it - a stale truth, which is worse than none because it is
+                    // confidently wrong.
+                    let _ = graph_db.execute_gql_write(
+                        "MATCH (n:SpireNode) WHERE n.node_type = 'Capability' DETACH DELETE n",
+                    );
+                    for p in &platforms {
+                        let Some(blocks) = p.get("capability_blocks").filter(|b| b.is_object())
+                        else {
+                            continue;
+                        };
+                        let board_id = p.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+                        let now = Utc::now();
+                        // One node per capability path, keyed by the path itself so a re-seed upserts
+                        // rather than churning ids - the same reason the platform nodes are keyed by
+                        // the registry id.
+                        for path in blocks
+                            .get("capabilities")
+                            .and_then(|v| v.as_array())
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|v| v.as_str())
+                        {
+                            let attr = AttrNode {
+                                id: path.to_string(),
+                                node_type: "Capability".to_string(),
+                                subtype: None,
+                                name: path.to_string(),
+                                description: None,
+                                properties: HashMap::new(),
+                                embedding_id: None,
+                                created_at: now,
+                                updated_at: now,
+                                version: 1,
+                            };
+                            actor.store_attr_node_via_gql(&attr, None)?;
+                        }
+                        // A board **realizes** a capability. A chip has no edges - it *is* the
+                        // capability - which is why this reads `realizes` and not `capabilities`.
+                        // NOTE: `via` and `carries` edges are not written yet; the platform nodes they
+                        // would point at already exist.
+                        for edge in blocks
+                            .get("realizes")
+                            .and_then(|v| v.as_array())
+                            .into_iter()
+                            .flatten()
+                        {
+                            let Some(path) = edge.get("capability").and_then(|v| v.as_str()) else {
+                                continue;
+                            };
+                            actor.store_edge_via_gql(board_id, "realizes", path, &[])?;
+                        }
+                    }
                     self.schedule_snapshot();
                     info!(
                         "BootstrapPlatforms: stored {} platform definitions",
