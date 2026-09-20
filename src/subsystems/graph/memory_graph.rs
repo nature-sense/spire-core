@@ -304,6 +304,21 @@ pub enum MemoryGraphMessage {
     /// Each element is `{ "id", "name", "properties": {flat map} }` — the
     /// caller (spire-core) owns the platform YAML schema; the graph stores
     /// the nodes generically.
+    /// Seed the platform nodes from spire-code's registry. Each entry is
+    /// `{ "id", "name", "properties": {flat map} }`, and an entry may also carry a
+    /// `"capability_blocks"` key: the entry's declared capabilities, **already flattened** into
+    /// `capabilities` (node names), `realizes` and `carries` (edges), and `pins` (wiring, ignored
+    /// here). Flattened on the other side because it has to be — `spire-code` depends on this crate,
+    /// so this handler cannot walk their tree and is a **writer** by construction.
+    ///
+    /// The capability nodes and edges belong here, beside the platform nodes, and must be deleted
+    /// first for the same reason those are: the graph has to mirror the registry on every startup.
+    /// An edited board whose old capabilities survived would be verified against a graph that no
+    /// longer matches it — and a verifier reading a stale truth is worse than one with no truth,
+    /// because it is confidently wrong.
+    ///
+    /// Full spec, including the test that defines done: spire-code's `ISSUES.md` →
+    /// "The seeder, specified".
     BootstrapPlatforms {
         platforms: Vec<serde_json::Value>,
         reply_to: tokio::sync::oneshot::Sender<Result<()>>,
