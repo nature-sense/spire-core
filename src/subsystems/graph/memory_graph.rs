@@ -3009,7 +3009,7 @@ impl Actor for MemoryGraphActor {
                     // Delete all existing Platform nodes so the graph mirrors
                     // the registry exactly on every startup.
                     let _ = graph_db.execute_gql_write(
-                        "MATCH (n:SpireNode) WHERE n.node_type = 'platform' DETACH DELETE n",
+                        "MATCH (n:SpireNode) WHERE n.node_type = 'Platform' DETACH DELETE n",
                     );
 
                     for p in &platforms {
