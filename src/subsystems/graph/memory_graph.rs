@@ -3105,6 +3105,43 @@ impl Actor for MemoryGraphActor {
                             };
                             actor.store_edge_via_gql(board_id, "realizes", path, &[])?;
                         }
+                        // The chip that realizes each capability, when the block names one: an edge to
+                        // a *platform* node that already exists (the chips were seeded above), not to a
+                        // string. A capability the host realizes itself - `via: esp32p4` on an esp32p4
+                        // board - would be an edge from a thing to itself, which says nothing, so it is
+                        // skipped rather than written.
+                        for edge in blocks
+                            .get("realizes")
+                            .and_then(|v| v.as_array())
+                            .into_iter()
+                            .flatten()
+                        {
+                            let Some(path) = edge.get("capability").and_then(|v| v.as_str()) else {
+                                continue;
+                            };
+                            let via = edge
+                                .get("properties")
+                                .and_then(|p| p.get("via"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default();
+                            if !via.is_empty() && via != board_id {
+                                actor.store_edge_via_gql(path, "via", via, &[])?;
+                            }
+                        }
+                        // And the silicon a board carries *beside* its host. A companion is a platform
+                        // node like any other, which is the whole reason an ESP32-C6 can be a chip on
+                        // a board rather than a second board.
+                        for companion in blocks
+                            .get("carries")
+                            .and_then(|v| v.as_array())
+                            .into_iter()
+                            .flatten()
+                        {
+                            let Some(chip) = companion.get("chip").and_then(|v| v.as_str()) else {
+                                continue;
+                            };
+                            actor.store_edge_via_gql(board_id, "carries", chip, &[])?;
+                        }
                     }
                     self.schedule_snapshot();
                     info!(
