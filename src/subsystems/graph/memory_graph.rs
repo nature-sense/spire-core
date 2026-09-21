@@ -1066,10 +1066,20 @@ impl MemoryGraphActor {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("GraphDb not initialized"))?;
 
-        let props_str = Self::gql_props(properties);
+        // An **empty** props map must be omitted, not written as `{}`: SeleneDB's parser rejects a
+        // relationship props clause with no identifier in it (`parse failed: expected prop_ident`)
+        // - the same family of limitation documented on `format_value_as_gql`. This went unnoticed
+        // because the only long-standing caller always passes properties, while every capability
+        // edge passes `&[]` - so `realizes`, `via` and `carries` failed to write *every* time,
+        // aborting the whole bootstrap on the first edge and leaving nodes with no edges.
+        let props_str = if properties.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", Self::gql_props(properties))
+        };
 
         let gql = format!(
-            "MATCH (a), (b) WHERE a.uuid = '{}' AND b.uuid = '{}' INSERT (a)-[e:{} {}]->(b)",
+            "MATCH (a), (b) WHERE a.uuid = '{}' AND b.uuid = '{}' INSERT (a)-[e:{}{}]->(b)",
             Self::gql_escape(from_uuid),
             Self::gql_escape(to_uuid),
             predicate,
@@ -1077,6 +1087,30 @@ impl MemoryGraphActor {
         );
         graph_db.execute_gql_write(&gql)?;
         Ok(())
+    }
+
+    /// Store a capability edge: `realizes`, `via` or `carries`.
+    ///
+    /// These carry the metadata **every** reader requires, which is not optional detail:
+    /// `parse_edge_from_row` treats `uuid` and `edge_type` as mandatory (`?` on each), so an edge
+    /// stored without them is written to the graph and then silently dropped by every read - no
+    /// error, no edge, which is how the seeder's first three edge writes managed to fail while
+    /// looking correct. The predicate is stored as the `edge_type` *property* and as the
+    /// relationship label, because the label is what the graph itself can traverse.
+    fn store_capability_edge_via_gql(
+        &self,
+        from_uuid: &str,
+        predicate: &str,
+        to_uuid: &str,
+    ) -> Result<()> {
+        let edge_uuid = Uuid::new_v4().to_string();
+        let created_at = Utc::now().to_rfc3339();
+        let props: Vec<(&str, &str)> = vec![
+            (PROP_UUID, &edge_uuid),
+            (PROP_EDGE_TYPE, predicate),
+            (PROP_CREATED_AT, &created_at),
+        ];
+        self.store_edge_via_gql(from_uuid, predicate, to_uuid, &props)
     }
 
     /// Delete a node and all its edges via GQL.
@@ -3059,37 +3093,49 @@ impl Actor for MemoryGraphActor {
                     let _ = graph_db.execute_gql_write(
                         "MATCH (n:SpireNode) WHERE n.node_type = 'Capability' DETACH DELETE n",
                     );
+                    // One node per capability path, **deduped in-process before writing**. The same
+                    // path is declared by a chip *and* by the board built on it - `media.display` on
+                    // the P4 and on the P4-Nano - and the store does not dedup for us: storing the
+                    // same id twice yields two nodes. That leaves one capability in the graph twice
+                    // and makes every edge to it ambiguous (which of the two does `realizes` point
+                    // at?), so collecting first makes "one node per path" true by construction rather
+                    // than true by luck of which entry was written last.
+                    let paths: std::collections::BTreeSet<&str> = platforms
+                        .iter()
+                        .filter_map(|p| p.get("capability_blocks"))
+                        .flat_map(|b| {
+                            b.get("capabilities")
+                                .and_then(|v| v.as_array())
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|v| v.as_str())
+                        })
+                        .collect();
+                    let now = Utc::now();
+                    for path in &paths {
+                        let attr = AttrNode {
+                            // Keyed by the path: a capability is named by its place in the
+                            // vocabulary, and the registry's paths are already the graph's ids.
+                            id: path.to_string(),
+                            node_type: "Capability".to_string(),
+                            subtype: None,
+                            name: path.to_string(),
+                            description: None,
+                            properties: HashMap::new(),
+                            embedding_id: None,
+                            created_at: now,
+                            updated_at: now,
+                            version: 1,
+                        };
+                        actor.store_attr_node_via_gql(&attr, None)?;
+                    }
                     for p in &platforms {
                         let Some(blocks) = p.get("capability_blocks").filter(|b| b.is_object())
                         else {
                             continue;
                         };
                         let board_id = p.get("id").and_then(|v| v.as_str()).unwrap_or_default();
-                        let now = Utc::now();
-                        // One node per capability path, keyed by the path itself so a re-seed upserts
-                        // rather than churning ids - the same reason the platform nodes are keyed by
-                        // the registry id.
-                        for path in blocks
-                            .get("capabilities")
-                            .and_then(|v| v.as_array())
-                            .into_iter()
-                            .flatten()
-                            .filter_map(|v| v.as_str())
-                        {
-                            let attr = AttrNode {
-                                id: path.to_string(),
-                                node_type: "Capability".to_string(),
-                                subtype: None,
-                                name: path.to_string(),
-                                description: None,
-                                properties: HashMap::new(),
-                                embedding_id: None,
-                                created_at: now,
-                                updated_at: now,
-                                version: 1,
-                            };
-                            actor.store_attr_node_via_gql(&attr, None)?;
-                        }
+
                         // A board **realizes** a capability. A chip has no edges - it *is* the
                         // capability - which is why this reads `realizes` and not `capabilities`.
                         // NOTE: `via` and `carries` edges are not written yet; the platform nodes they
@@ -3103,7 +3149,7 @@ impl Actor for MemoryGraphActor {
                             let Some(path) = edge.get("capability").and_then(|v| v.as_str()) else {
                                 continue;
                             };
-                            actor.store_edge_via_gql(board_id, "realizes", path, &[])?;
+                            actor.store_capability_edge_via_gql(board_id, "realizes", path)?;
                         }
                         // The chip that realizes each capability, when the block names one: an edge to
                         // a *platform* node that already exists (the chips were seeded above), not to a
@@ -3125,7 +3171,7 @@ impl Actor for MemoryGraphActor {
                                 .and_then(|v| v.as_str())
                                 .unwrap_or_default();
                             if !via.is_empty() && via != board_id {
-                                actor.store_edge_via_gql(path, "via", via, &[])?;
+                                actor.store_capability_edge_via_gql(path, "via", via)?;
                             }
                         }
                         // And the silicon a board carries *beside* its host. A companion is a platform
@@ -3140,7 +3186,7 @@ impl Actor for MemoryGraphActor {
                             let Some(chip) = companion.get("chip").and_then(|v| v.as_str()) else {
                                 continue;
                             };
-                            actor.store_edge_via_gql(board_id, "carries", chip, &[])?;
+                            actor.store_capability_edge_via_gql(board_id, "carries", chip)?;
                         }
                     }
                     self.schedule_snapshot();

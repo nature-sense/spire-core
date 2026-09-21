@@ -394,6 +394,16 @@ pub enum RelationshipType {
     AstImports,
     #[serde(rename = "ast_references")]
     AstReferences,
+    /// The capability edges: a board `realizes` a declared capability, a capability is provided
+    /// `via` a chip (the on-board host or a companion), and a board `carries` a companion silicon.
+    /// Without variants for these the predicates are stored as text and read back as `Unknown` -
+    /// edges that exist in the graph and cannot be named, queryable only by their shape.
+    #[serde(rename = "realizes")]
+    Realizes,
+    #[serde(rename = "via")]
+    Via,
+    #[serde(rename = "carries")]
+    Carries,
     Custom(String),
     #[serde(other)]
     Unknown,
