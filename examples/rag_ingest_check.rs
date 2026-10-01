@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 NatureSense
 
-//! Throwaway verification: ingest the REAL ~/.spire/knowledge/a7s/ingest.yaml
-//! against the REAL KnowledgeStore and report what actually lands.
+//! Throwaway verification: ingest a corpus' REAL installed manifest (under
+//! `config::knowledge_dir()`, so the app's own store) against the REAL KnowledgeStore and report what
+//! actually lands.
 //! Run: `cargo run --example rag_ingest_check -p spire-core`
 
 use std::sync::Arc;
@@ -16,7 +17,9 @@ use tokio::sync::{mpsc, oneshot};
 
 #[tokio::main]
 async fn main() {
-    let knowledge = dirs::home_dir().unwrap().join(".spire/knowledge");
+    // The app's own store: per application, and `SPIRE_KNOWLEDGE_DIR` when set — see `rag_domain_check`
+    // for why a hand-built `~/.spire/knowledge` is the wrong directory to read.
+    let knowledge = spire_core::config::knowledge_dir();
     let manifest = knowledge.join("a7s/ingest.yaml");
     println!("knowledge dir : {}", knowledge.display());
     println!(

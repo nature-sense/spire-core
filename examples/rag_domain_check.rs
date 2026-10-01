@@ -5,7 +5,9 @@
 //!
 //! `rag_ingest_check` (the sibling example) *writes*: it ingests the real `a7s` manifest and reports
 //! what landed. This one only reads, which is what makes it useful after a fill or a restart: it opens
-//! `~/.spire/knowledge` the way the app does, counts the corpus state per domain, and prints it. If a
+//! the store the way the app does — `config::knowledge_dir()`, so `~/.spire/<app>/knowledge` and an
+//! `SPIRE_KNOWLEDGE_DIR` override both land on the store the app actually fills — counts the corpus
+//! state per domain, and prints it. If a
 //! fill has not survived (a WAL the next process discarded, a store the wrong process wrote), the
 //! numbers are missing here and nowhere else.
 //!
@@ -27,10 +29,10 @@ use spire_core::subsystems::graph::memory_graph::MemoryGraphActor;
 
 #[tokio::main]
 async fn main() {
-    let store = dirs::home_dir()
-        .expect("home dir")
-        .join(".spire")
-        .join("knowledge");
+    // `knowledge_dir`, not `~/.spire/knowledge`: the app's store is per application and honours
+    // `SPIRE_KNOWLEDGE_DIR`, so a hand-built path here would read a different store from the one the
+    // fill wrote — and report "nothing found" for a store that is full.
+    let store = spire_core::config::knowledge_dir();
     println!("KnowledgeStore: {}", store.display());
 
     let (tx, rx) = mpsc::channel(64);
