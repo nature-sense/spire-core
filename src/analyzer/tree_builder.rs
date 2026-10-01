@@ -295,9 +295,8 @@ fn classify_directory_role(name: &str, _path: &str) -> String {
         "ci" | ".github" | ".gitlab" | ".circleci" => "ci_cd".to_string(),
         "assets" | "static" | "public" | "images" | "img" | "media" => "static_assets".to_string(),
         "dist" | "build" | "target" | "out" | "output" => "build_output".to_string(),
-        "node_modules" | ".pnpm" | "vendor" | "third_party" | "third-party" => {
-            "dependencies".to_string()
-        }
+        "node_modules" | ".pnpm" | "vendor" | "third_party" | "third-party"
+        | "managed_components" => "dependencies".to_string(),
         "benchmarks" | "bench" => "benchmarks".to_string(),
         "data" | "dataset" | "datasets" => "data".to_string(),
         "migrations" | "migrate" => "migrations".to_string(),

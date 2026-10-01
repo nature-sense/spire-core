@@ -39,6 +39,13 @@ pub const BUILD_CONFIG_FILES: &[&str] = &[
 const SKIP_DIRS: &[&str] = &[
     "node_modules",
     ".pnpm",
+    // The **ESP-IDF component manager's download cache**: a BSP brings a whole tree with it — its own
+    // sources, `examples/*/main`, `test_apps/*`, sub-components — and every one of those carries a
+    // `CMakeLists.txt`. This is the C++/ESP-IDF counterpart of `node_modules`: downloaded, regenerable,
+    // and not the user's source. Leaving it out made a single `project/open` enumerate *hundreds* of
+    // "subprojects" (esp_lvgl_port, esp_cam_sensor, usb_host_uvc, esp_video …) and hang the UI
+    // rendering them.
+    "managed_components",
     "target",
     "dist",
     "build",
@@ -451,5 +458,85 @@ mod tests {
         )
         .unwrap();
         assert!(!is_cargo_workspace_member(&standalone.join("Cargo.toml")));
+    }
+
+    /// Regression: `managed_components/` is the ESP-IDF component manager's **download cache**. A BSP
+    /// fetched into it brings its own sources, `examples/*/main` and `test_apps/*`, and every one of
+    /// those carries a `CMakeLists.txt` — so before it was skipped, a single `project/open` enumerated
+    /// hundreds of "subprojects" (esp_lvgl_port, esp_cam_sensor, usb_host_uvc, esp_video …) and a file
+    /// tree to match, which is what hung the UI. It is the C++/ESP-IDF counterpart of `node_modules`:
+    /// downloaded, regenerable, and not the user's source. Mirrors the Meson/Cargo precedent above —
+    /// these are *not* independent projects, they are fetched dependency internals.
+    #[test]
+    fn managed_components_is_not_walked_as_project_source() {
+        let tmp = tempdir().unwrap();
+        // Non-hidden project root (tempfile's own root starts with `.`).
+        let root = tmp.path().join("app");
+        fs::create_dir_all(&root).unwrap();
+
+        // The user's app: a root project plus one `main/` component, as the scaffold emits.
+        fs::create_dir_all(root.join("main")).unwrap();
+        fs::write(
+            root.join("CMakeLists.txt"),
+            "cmake_minimum_required(VERSION 3.16)\ninclude($ENV{IDF_PATH}/tools/cmake/project.cmake)\nproject(air_quality)\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("main/CMakeLists.txt"),
+            "idf_component_register(SRCS \"main.c\")\n",
+        )
+        .unwrap();
+        fs::write(root.join("main/main.c"), "void app_main(void) {}\n").unwrap();
+
+        // The fetched dependency tree: a BSP with its own CMakeLists, plus the example/test_apps
+        // subtrees that turned one open into hundreds of "subprojects".
+        let bsp = root.join("managed_components/espressif__esp_lvgl_port");
+        fs::create_dir_all(bsp.join("examples/demo/main")).unwrap();
+        fs::create_dir_all(bsp.join("test_apps/render")).unwrap();
+        fs::write(bsp.join("CMakeLists.txt"), "idf_component_register()\n").unwrap();
+        fs::write(bsp.join("examples/demo/CMakeLists.txt"), "project(demo)\n").unwrap();
+        fs::write(
+            bsp.join("examples/demo/main/CMakeLists.txt"),
+            "idf_component_register()\n",
+        )
+        .unwrap();
+        fs::write(
+            bsp.join("test_apps/render/CMakeLists.txt"),
+            "idf_component_register()\n",
+        )
+        .unwrap();
+
+        // 1. The build-file walk sees the app's two CMakeLists (root + `main/`) and *none* of the
+        //    BSP's — that is precisely the leak that produced the phantom subprojects.
+        let found = discover_build_files(&root, false);
+        let mut configs: Vec<&str> = found.iter().map(|(p, _)| p.as_str()).collect();
+        configs.sort();
+        assert_eq!(
+            configs,
+            vec!["CMakeLists.txt", "main/CMakeLists.txt"],
+            "managed_components leaked into the build-file walk"
+        );
+
+        // 2. The file tree skips it in both modes (ignore-crate and walkdir).
+        for no_ignore in [false, true] {
+            let files = scan_directory(&root, no_ignore);
+            assert!(
+                !files
+                    .iter()
+                    .any(|f| f.relative_path.contains("managed_components")),
+                "managed_components leaked into the file tree (no_ignore={no_ignore})"
+            );
+            // The app's own sources are still there — the skip must not be over-broad.
+            assert!(
+                files.iter().any(|f| f.relative_path == "main/main.c"),
+                "the app's own source vanished (no_ignore={no_ignore})"
+            );
+        }
+
+        // 3. The predicate agrees, at the directory itself and at any depth beneath it.
+        assert!(should_skip("managed_components"));
+        assert!(should_skip(
+            "managed_components/espressif__esp_lvgl_port/examples/demo/main/main.c"
+        ));
     }
 }

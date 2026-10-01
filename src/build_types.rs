@@ -224,11 +224,40 @@ pub enum ProjectStructure {
     /// dependency is a recorded fact rather than something a later reader has to infer from `../` in
     /// a path.
     EmbeddedApp,
+    /// **An ESP-IDF component library**: a project whose product is `components/*` — protocol
+    /// drivers, board support packages, and the framework they share — so that applications depend
+    /// on it rather than containing it.
+    ///
+    /// The C++/ESP-IDF counterpart of [`ProjectStructure::Embedded`], and deliberately *simpler*:
+    /// on ESP-IDF there is no separate HAL to invent, because IDF already is one, and no BSP
+    /// concept to model, because a board's BSP is a component like any other. What a firmware
+    /// family accumulates is a **catalogue of components**, and that is the whole of this type.
+    ///
+    /// It holds **no actors and no application entry point**. `main/` exists only so
+    /// `idf.py build` compile-checks the components; the actors that use them live in an
+    /// [`ProjectStructure::IdfApplication`].
+    ///
+    /// Recognized by a **declaration**, not a layout guess: the root `CMakeLists.txt` carries
+    /// `set(SPIRE_PROJECT_STRUCTURE idf_library)`.
+    IdfLibrary,
+    /// **An ESP-IDF application**: a project with `main/`, the actors and the wiring, built
+    /// against one or more [`ProjectStructure::IdfLibrary`] projects.
+    ///
+    /// The split is the point. A library holds what is reusable and knows nothing about any
+    /// particular product; an application holds the **composition** — which components are used,
+    /// how the actors are wired, and the board facts (pins, bus, addresses) that turn a shelf of
+    /// parts into a device. Making a library into an application is how a second product begins by
+    /// copying the first, which is the thing this split exists to prevent.
+    ///
+    /// Declared the same way, and for the same reason:
+    /// `set(SPIRE_PROJECT_STRUCTURE idf_application)`.
+    IdfApplication,
 }
 
 impl ProjectStructure {
     /// Stable snake_case key ("native" | "single_source" | "hal" | "spire_app" |
-    /// "embedded" | "embedded_app"), matching `#[serde(rename_all = "snake_case")]`.
+    /// "embedded" | "embedded_app" | "idf_library" | "idf_application"), matching
+    /// `#[serde(rename_all = "snake_case")]`.
     pub fn as_str(&self) -> &'static str {
         match self {
             ProjectStructure::Native => "native",
@@ -237,6 +266,8 @@ impl ProjectStructure {
             ProjectStructure::SpireApp => "spire_app",
             ProjectStructure::Embedded => "embedded",
             ProjectStructure::EmbeddedApp => "embedded_app",
+            ProjectStructure::IdfLibrary => "idf_library",
+            ProjectStructure::IdfApplication => "idf_application",
         }
     }
 
@@ -249,6 +280,8 @@ impl ProjectStructure {
             "spire_app" => ProjectStructure::SpireApp,
             "embedded" => ProjectStructure::Embedded,
             "embedded_app" => ProjectStructure::EmbeddedApp,
+            "idf_library" => ProjectStructure::IdfLibrary,
+            "idf_application" => ProjectStructure::IdfApplication,
             _ => ProjectStructure::Native,
         }
     }
