@@ -1,2 +1,5 @@
 /target
 /.spire
+
+# macOS
+.DS_Store
