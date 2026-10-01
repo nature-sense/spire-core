@@ -307,9 +307,11 @@ pub enum MemoryGraphMessage {
     /// Seed the platform nodes from spire-code's registry. Each entry is
     /// `{ "id", "name", "properties": {flat map} }`, and an entry may also carry a
     /// `"capability_blocks"` key: the entry's declared capabilities, **already flattened** into
-    /// `capabilities` (node names), `realizes` and `carries` (edges), and `pins` (wiring, ignored
-    /// here). Flattened on the other side because it has to be — `spire-code` depends on this crate,
-    /// so this handler cannot walk their tree and is a **writer** by construction.
+    /// `capabilities` (node names), `realizes` (boards) and `provides` (chips) and `carries` (edges,
+    /// each with its values), and `pins` (a board's wiring: one entry per declared function, for a
+    /// `Pin` node and a `pins` edge each). Flattened on the other side because it has to be —
+    /// `spire-code` depends on this crate, so this handler cannot walk their tree and is a **writer**
+    /// by construction.
     ///
     /// The capability nodes and edges belong here, beside the platform nodes, and must be deleted
     /// first for the same reason those are: the graph has to mirror the registry on every startup.
@@ -1089,7 +1091,7 @@ impl MemoryGraphActor {
         Ok(())
     }
 
-    /// Store a capability edge: `realizes`, `via` or `carries`.
+    /// Store a capability edge: `realizes`, `via`, `carries` or `provides`.
     ///
     /// These carry the metadata **every** reader requires, which is not optional detail:
     /// `parse_edge_from_row` treats `uuid` and `edge_type` as mandatory (`?` on each), so an edge
@@ -1097,20 +1099,50 @@ impl MemoryGraphActor {
     /// error, no edge, which is how the seeder's first three edge writes managed to fail while
     /// looking correct. The predicate is stored as the `edge_type` *property* and as the
     /// relationship label, because the label is what the graph itself can traverse.
+    ///
+    /// The capability's own `properties` ride along with that metadata, each as a native GQL literal
+    /// via [`Self::format_value_as_gql`]: scalars stay typed, and an array/object becomes a
+    /// JSON-encoded string (the only scalar shape the parser accepts), so a nested value like `tops`
+    /// or `link` survives. `parse_edge_from_row` reads every non-metadata key back into
+    /// `GraphEdge.properties`, so these are exactly the values a caller queries the edge for.
     fn store_capability_edge_via_gql(
         &self,
         from_uuid: &str,
         predicate: &str,
         to_uuid: &str,
+        properties: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<()> {
-        let edge_uuid = Uuid::new_v4().to_string();
-        let created_at = Utc::now().to_rfc3339();
-        let props: Vec<(&str, &str)> = vec![
-            (PROP_UUID, &edge_uuid),
-            (PROP_EDGE_TYPE, predicate),
-            (PROP_CREATED_AT, &created_at),
+        let graph_db = self
+            .graph_db
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("GraphDb not initialized"))?;
+
+        let mut parts: Vec<String> = vec![
+            format!(
+                "{}: '{}'",
+                PROP_UUID,
+                Self::gql_escape(&Uuid::new_v4().to_string())
+            ),
+            format!("{}: '{}'", PROP_EDGE_TYPE, Self::gql_escape(predicate)),
+            format!(
+                "{}: '{}'",
+                PROP_CREATED_AT,
+                Self::gql_escape(&Utc::now().to_rfc3339())
+            ),
         ];
-        self.store_edge_via_gql(from_uuid, predicate, to_uuid, &props)
+        for (key, value) in properties {
+            parts.push(format!("{}: {}", key, Self::format_value_as_gql(value)));
+        }
+
+        let gql = format!(
+            "MATCH (a), (b) WHERE a.uuid = '{}' AND b.uuid = '{}' INSERT (a)-[e:{} {{{}}}]->(b)",
+            Self::gql_escape(from_uuid),
+            Self::gql_escape(to_uuid),
+            predicate,
+            parts.join(", ")
+        );
+        graph_db.execute_gql_write(&gql)?;
+        Ok(())
     }
 
     /// Delete a node and all its edges via GQL.
@@ -1389,33 +1421,30 @@ impl MemoryGraphActor {
         if node.node_type_str() != "Platform" {
             return None;
         }
-        let mut props = serde_json::Map::new();
-        for key in [
-            "os",
-            "cpu_family",
-            "cpu",
-            "endian",
-            "target_triple",
-            "march",
-            "c_compiler",
-            "cpp_compiler",
-            "ar",
-            "strip",
-            "ld",
-            "pkgconfig",
-            "c_args_extra",
-            "cpp_args_extra",
-            "linker_args_extra",
-            "needs_exe_wrapper",
-            "sysroot_root",
-            "sysroot_lib_dirs",
-            "sysroot_include_dirs",
-            "sysroot_pkg_config_libdir",
-        ] {
-            if let Some(v) = node.get(key) {
-                props.insert(key.to_string(), v.clone());
-            }
-        }
+        // Every stored fact travels — **not a whitelist**. The graph *is* the registry, and the
+        // properties a platform node carries are exactly the ones its codec wrote
+        // (`platform_to_registry_json`), so the only keys to drop are the envelope's own. A
+        // whitelist here silently dropped whatever it did not name — `chip` (which entry is a
+        // board), `family`, the Rust toolchain, `library_hints`, the device endpoint — so a platform
+        // read back from the graph lost facts a build (`rust_target`) and the fill prompt
+        // (`library_hints`) both depend on.
+        const BASE_KEYS: [&str; 9] = [
+            PROP_UUID,
+            PROP_NODE_TYPE,
+            PROP_NAME,
+            PROP_DESCRIPTION,
+            PROP_SUBTYPE,
+            PROP_EMBEDDING_ID,
+            PROP_CREATED_AT,
+            PROP_UPDATED_AT,
+            PROP_VERSION,
+        ];
+        let props: serde_json::Map<String, serde_json::Value> = node
+            .properties
+            .iter()
+            .filter(|(key, _)| !BASE_KEYS.contains(&key.as_str()))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
         let name = node.name().to_string();
         Some(serde_json::json!({
             "id": node.name(),
@@ -3093,6 +3122,11 @@ impl Actor for MemoryGraphActor {
                     let _ = graph_db.execute_gql_write(
                         "MATCH (n:SpireNode) WHERE n.node_type = 'Capability' DETACH DELETE n",
                     );
+                    // The **pin** nodes the same way: wiring is board facts with a node of its own
+                    // (`Pin`, one per declared function), so they mirror the registry too.
+                    let _ = graph_db.execute_gql_write(
+                        "MATCH (n:SpireNode) WHERE n.node_type = 'Pin' DETACH DELETE n",
+                    );
                     // One node per capability path, **deduped in-process before writing**. The same
                     // path is declared by a chip *and* by the board built on it - `media.display` on
                     // the P4 and on the P4-Nano - and the store does not dedup for us: storing the
@@ -3136,10 +3170,9 @@ impl Actor for MemoryGraphActor {
                         };
                         let board_id = p.get("id").and_then(|v| v.as_str()).unwrap_or_default();
 
-                        // A board **realizes** a capability. A chip has no edges - it *is* the
-                        // capability - which is why this reads `realizes` and not `capabilities`.
-                        // NOTE: `via` and `carries` edges are not written yet; the platform nodes they
-                        // would point at already exist.
+                        // A board **realizes** a capability, and carries the board's own values for
+                        // it (`interface`, …) on the edge. `via` is excluded: it names the *chip*,
+                        // which is the separate `via` edge below, not a fact about the realization.
                         for edge in blocks
                             .get("realizes")
                             .and_then(|v| v.as_array())
@@ -3149,13 +3182,22 @@ impl Actor for MemoryGraphActor {
                             let Some(path) = edge.get("capability").and_then(|v| v.as_str()) else {
                                 continue;
                             };
-                            actor.store_capability_edge_via_gql(board_id, "realizes", path)?;
+                            let mut props = edge
+                                .get("properties")
+                                .and_then(|v| v.as_object())
+                                .cloned()
+                                .unwrap_or_default();
+                            props.remove("via");
+                            actor.store_capability_edge_via_gql(
+                                board_id, "realizes", path, &props,
+                            )?;
                         }
                         // The chip that realizes each capability, when the block names one: an edge to
                         // a *platform* node that already exists (the chips were seeded above), not to a
                         // string. A capability the host realizes itself - `via: esp32p4` on an esp32p4
                         // board - would be an edge from a thing to itself, which says nothing, so it is
-                        // skipped rather than written.
+                        // skipped rather than written. The edge is topology: the chip's own values are
+                        // its `provides` edges below, not a property of this one.
                         for edge in blocks
                             .get("realizes")
                             .and_then(|v| v.as_array())
@@ -3171,12 +3213,19 @@ impl Actor for MemoryGraphActor {
                                 .and_then(|v| v.as_str())
                                 .unwrap_or_default();
                             if !via.is_empty() && via != board_id {
-                                actor.store_capability_edge_via_gql(path, "via", via)?;
+                                actor.store_capability_edge_via_gql(
+                                    path,
+                                    "via",
+                                    via,
+                                    &serde_json::Map::new(),
+                                )?;
                             }
                         }
-                        // And the silicon a board carries *beside* its host. A companion is a platform
+                        // The silicon a board carries *beside* its host. A companion is a platform
                         // node like any other, which is the whole reason an ESP32-C6 can be a chip on
-                        // a board rather than a second board.
+                        // a board rather than a second board - and everything written beside it
+                        // (`role`, `link`, `firmware`) is stored on the edge, minus the `chip` id,
+                        // which is the edge's endpoint.
                         for companion in blocks
                             .get("carries")
                             .and_then(|v| v.as_array())
@@ -3186,7 +3235,79 @@ impl Actor for MemoryGraphActor {
                             let Some(chip) = companion.get("chip").and_then(|v| v.as_str()) else {
                                 continue;
                             };
-                            actor.store_capability_edge_via_gql(board_id, "carries", chip)?;
+                            // `seeder_input` hands the companion as `{chip, properties}`, so its
+                            // values live under `properties` — reading the whole entry would store a
+                            // nested `properties` blob on the edge instead of `role`/`link`/…, and
+                            // the read side would hand that blob straight back.
+                            let props = companion
+                                .get("properties")
+                                .and_then(|v| v.as_object())
+                                .cloned()
+                                .unwrap_or_default();
+                            actor
+                                .store_capability_edge_via_gql(board_id, "carries", chip, &props)?;
+                        }
+                        // And what a *chip* provides: its `capabilities:` values, on a `provides`
+                        // edge the other way (chip -> capability). This is the chip-side half of the
+                        // resolved profile, and the reason a capability node is identity only: the
+                        // same `media.camera` is `mipi-csi` here and `parallel` on a board, so the
+                        // values live on the edge that says who is claiming it.
+                        for provided in blocks
+                            .get("provides")
+                            .and_then(|v| v.as_array())
+                            .into_iter()
+                            .flatten()
+                        {
+                            let Some(path) = provided.get("capability").and_then(|v| v.as_str())
+                            else {
+                                continue;
+                            };
+                            let props = provided
+                                .get("properties")
+                                .and_then(|v| v.as_object())
+                                .cloned()
+                                .unwrap_or_default();
+                            actor.store_capability_edge_via_gql(
+                                board_id, "provides", path, &props,
+                            )?;
+                        }
+                        // And the board's **wiring**: one `Pin` node per declared function — the node
+                        // is the *function* (`led`, `grove.a`) and the edge carries the assignment —
+                        // so a pin is a graph fact like a capability, not a blob on the board. The id
+                        // is board-scoped: `led` on two boards is two functions, never one.
+                        for pin in blocks
+                            .get("pins")
+                            .and_then(|v| v.as_array())
+                            .into_iter()
+                            .flatten()
+                        {
+                            let Some(function) = pin.get("function").and_then(|v| v.as_str())
+                            else {
+                                continue;
+                            };
+                            let pin_id = format!("{board_id}/pins/{function}");
+                            let now = Utc::now();
+                            let attr = AttrNode {
+                                id: pin_id.clone(),
+                                node_type: "Pin".to_string(),
+                                subtype: None,
+                                name: function.to_string(),
+                                description: None,
+                                properties: HashMap::new(),
+                                embedding_id: None,
+                                created_at: now,
+                                updated_at: now,
+                                version: 1,
+                            };
+                            actor.store_attr_node_via_gql(&attr, None)?;
+
+                            let props = pin
+                                .get("properties")
+                                .and_then(|v| v.as_object())
+                                .cloned()
+                                .unwrap_or_default();
+                            actor
+                                .store_capability_edge_via_gql(board_id, "pins", &pin_id, &props)?;
                         }
                     }
                     self.schedule_snapshot();

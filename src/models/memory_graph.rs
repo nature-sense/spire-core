@@ -386,6 +386,12 @@ pub enum RelationshipType {
     InformedBy,
     #[serde(rename = "has_diagnostic")]
     HasDiagnostic,
+    /// A module `has_edit` an edit record: the typed instruction an edit was run from and what its
+    /// gate did about it. Named rather than left to `Custom` so the predicate round-trips as itself
+    /// — an unnamed one is stored as text and read back as `Unknown`, leaving a history that can be
+    /// walked but not named.
+    #[serde(rename = "has_edit")]
+    HasEdit,
     #[serde(rename = "ast_child")]
     AstChild,
     #[serde(rename = "ast_calls")]
@@ -404,6 +410,18 @@ pub enum RelationshipType {
     Via,
     #[serde(rename = "carries")]
     Carries,
+    /// A chip `provides` a capability: the silicon's own declaration, with its values (`interface`,
+    /// `cores`, `tops`, …) stored on the edge. The counterpart of a board's `realizes`, and the
+    /// reason a capability node is identity only — the same `media.camera` is `mipi-csi` on a chip
+    /// and `parallel` on a board, so the values belong to whoever is claiming it.
+    #[serde(rename = "provides")]
+    Provides,
+    /// A board `pins` a declared function: the edge from the board to a `Pin` node (the *function* a
+    /// driver names — `led`, `grove.a`), carrying the assignment (`pin`, `addressable`, `sda`, …).
+    /// Wiring is a board fact with its own nodes, exactly as a capability does, so it lives in the
+    /// graph rather than only in the registry seed beside it.
+    #[serde(rename = "pins")]
+    Pins,
     Custom(String),
     #[serde(other)]
     Unknown,

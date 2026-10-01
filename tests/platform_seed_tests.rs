@@ -98,23 +98,41 @@ fn has_pair(edges: &[GraphEdge], from: &str, to: &str) -> bool {
     pairs(edges).iter().any(|(f, t)| f == from && t == to)
 }
 
+/// The properties of the `from -> to` edge, if it exists — the capability's values, stored on the
+/// edge rather than on the shared capability node.
+fn props_of(
+    edges: &[GraphEdge],
+    from: &str,
+    to: &str,
+) -> Option<std::collections::HashMap<String, serde_json::Value>> {
+    edges
+        .iter()
+        .find(|e| e.from_id == from && e.to_id == to)
+        .map(|e| e.properties.clone())
+}
+
 fn sorted_ids(nodes: &[AttrNode]) -> Vec<String> {
     let mut ids: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
     ids.sort();
     ids
 }
 
-/// A chip entry: it *is* its capabilities, so it declares paths and no edges.
+/// A chip entry: it *is* its capabilities, so it declares paths and no `realizes` edges — but it
+/// does **provide** them, and the silicon's own values ride on those `provides` edges.
 fn chip(id: &str, paths: &[&str]) -> serde_json::Value {
+    let provides: Vec<serde_json::Value> = paths
+        .iter()
+        .map(|p| json!({ "capability": p, "properties": { "silicon": id, "cores": 4 } }))
+        .collect();
     json!({
         "id": id,
         "name": id,
         "properties": {},
         "capability_blocks": {
             "capabilities": paths,
+            "provides": provides,
             "realizes": [],
             "carries": [],
-            "pins": {},
         }
     })
 }
@@ -143,13 +161,25 @@ fn registry() -> Vec<serde_json::Value> {
             "capability_blocks": {
                 "capabilities": ["media.display", "radio.wifi"],
                 "realizes": [
-                    {"capability": "media.display", "properties": {"via": "esp32p4"}},
-                    {"capability": "radio.wifi", "properties": {"via": "esp32c5"}},
+                    {
+                        "capability": "media.display",
+                        "properties": {"via": "esp32p4", "interface": "spi"},
+                    },
+                    {
+                        "capability": "radio.wifi",
+                        "properties": {"via": "esp32c5", "standard": "802.11ax"},
+                    },
                     // The tautology case: a `via` naming the board itself. Skipped, not written.
                     {"capability": "compute.ml", "properties": {"via": "waveshare-esp32-p4-nano"}},
                 ],
-                "carries": [{"chip": "esp32c5"}],
-                "pins": {"i2c": {"sda": "GPIO7"}},
+                // The shape `seeder_input` actually produces: `{chip, properties}` — the chip id as
+                // the edge's target, everything written beside it under `properties`.
+                "carries": [
+                    {"chip": "esp32c5", "properties": {"role": "radio", "link": {"bus": "sdio"}}}
+                ],
+                // Wiring flattens to one entry per declared **function** — the shape `seeder_input`
+                // produces — for a `Pin` node and a `pins` edge each.
+                "pins": [{"function": "i2c", "properties": {"sda": "GPIO7"}}],
             }
         }),
     ]
@@ -247,6 +277,139 @@ async fn bootstrap_seeds_capability_nodes_and_edges() {
     );
 }
 
+/// The capability's **values** ride on the edge, not the node: a board's realization values
+/// (`interface`) on `realizes`, a companion's (`role`, `link`) on `carries`, and a chip's own
+/// (`silicon`, `cores`) on `provides`. Read back through `GraphEdge.properties`, they are the
+/// values a caller queries for. A capability node is identity only — the same `media.camera` is
+/// `spi` here and `mipi-csi` on a chip — so anything stored on the node would collide.
+#[tokio::test]
+async fn capability_values_are_stored_on_the_edges() {
+    let tx = spawn_graph().await;
+    bootstrap(&tx, registry()).await;
+
+    // Board -realizes-> capability, carrying the board's own values. `via` is *not* among them:
+    // it names the chip, and is the separate `via` edge.
+    let board_edges = edges_of(&tx, "waveshare-esp32-p4-nano").await;
+    let realizes = props_of(&board_edges, "waveshare-esp32-p4-nano", "media.display")
+        .expect("the board realizes media.display");
+    assert_eq!(realizes["interface"], json!("spi"));
+    assert!(
+        !realizes.contains_key("via"),
+        "`via` is the edge's endpoint, not a stored property: {realizes:?}"
+    );
+
+    // Board -carries-> companion, with everything written beside the chip (minus its id). A nested
+    // value is stored as a JSON-encoded scalar and restored to its structured form on the way back
+    // (`selene_value_to_json`), so `link` is an object here, not a string.
+    let carries = props_of(&board_edges, "waveshare-esp32-p4-nano", "esp32c5")
+        .expect("the board carries esp32c5");
+    assert_eq!(carries["role"], json!("radio"));
+    assert_eq!(
+        carries["link"],
+        json!({ "bus": "sdio" }),
+        "a nested value round-trips to its structured form: {carries:?}"
+    );
+
+    // Chip -provides-> capability, carrying the silicon's own values, and reading back **named** so
+    // it can be asked for by kind rather than found by shape.
+    let chip_edges = edges_of(&tx, "esp32p4").await;
+    let provides =
+        props_of(&chip_edges, "esp32p4", "compute.ml").expect("esp32p4 provides compute.ml");
+    assert_eq!(provides["silicon"], json!("esp32p4"));
+    assert_eq!(
+        provides["cores"],
+        json!(4),
+        "a scalar keeps its type: {provides:?}"
+    );
+    let kinds: std::collections::BTreeSet<String> = chip_edges
+        .iter()
+        .map(|e| format!("{:?}", e.edge_type))
+        .collect();
+    assert!(
+        kinds.contains("Provides"),
+        "provides must read back named: {kinds:?}"
+    );
+}
+
+/// A board's wiring becomes **its own nodes and edges**: one `Pin` node per declared function — the
+/// node is the function, and the id is board-scoped so `led` on two boards is two functions — and a
+/// `pins` edge carrying the assignment. The read side finds it by kind, the way it finds a
+/// capability, instead of parsing a blob off the board.
+/// **Every** platform fact survives the graph read — not a whitelist's worth. The graph is the
+/// registry, so a read that named only some keys dropped the rest: `chip` (which entry is a board),
+/// `rust_target` (what a build keys on), `library_hints` (what the fill prompt reads). A whitelist
+/// in `platform_node_to_json` did exactly that.
+#[tokio::test]
+async fn every_platform_fact_survives_the_graph_read() {
+    let tx = spawn_graph().await;
+    let mut board = registry().pop().expect("the board");
+    board["properties"] = json!({
+        "os": "esp-idf",
+        "family": "esp32",
+        "chip": "esp32p4",
+        "rust_target": "riscv32imafc-esp-espidf",
+        "library_hints": "the board's own notes",
+        "device_mcp_url": "http://x/mcp",
+    });
+    bootstrap(&tx, vec![board]).await;
+
+    let (t, r) = oneshot::channel();
+    tx.send(MemoryGraphMessage::GetPlatforms { reply_to: t })
+        .await
+        .expect("send get");
+    let nodes = r.await.expect("get reply").expect("get ok");
+    let props = nodes[0]["properties"]
+        .as_object()
+        .expect("the platform node's properties");
+
+    for key in [
+        "family",
+        "chip",
+        "rust_target",
+        "library_hints",
+        "device_mcp_url",
+    ] {
+        assert!(
+            props.contains_key(key),
+            "`{key}` must survive the read: {props:?}"
+        );
+    }
+    assert!(
+        props.get("uuid").is_none(),
+        "the envelope's own keys are not facts: {props:?}"
+    );
+}
+
+#[tokio::test]
+async fn wiring_is_its_own_node_and_edge() {
+    let tx = spawn_graph().await;
+    bootstrap(&tx, registry()).await;
+
+    let pins = nodes_of_type(&tx, "Pin").await;
+    assert_eq!(
+        sorted_ids(&pins),
+        vec!["waveshare-esp32-p4-nano/pins/i2c"],
+        "one node per function, board-scoped"
+    );
+    assert_eq!(pins[0].name, "i2c");
+
+    let edges = edges_of(&tx, "waveshare-esp32-p4-nano").await;
+    let props = props_of(
+        &edges,
+        "waveshare-esp32-p4-nano",
+        "waveshare-esp32-p4-nano/pins/i2c",
+    )
+    .expect("the board pins its i2c function");
+    assert_eq!(props["sda"], json!("GPIO7"));
+
+    let kinds: std::collections::BTreeSet<String> =
+        edges.iter().map(|e| format!("{:?}", e.edge_type)).collect();
+    assert!(
+        kinds.contains("Pins"),
+        "the predicate reads back named: {kinds:?}"
+    );
+}
+
 #[tokio::test]
 async fn re_bootstrap_without_blocks_leaves_nothing_behind() {
     let tx = spawn_graph().await;
@@ -270,6 +433,10 @@ async fn re_bootstrap_without_blocks_leaves_nothing_behind() {
     assert!(
         nodes_of_type(&tx, "Capability").await.is_empty(),
         "capability nodes must not survive a bootstrap that declares none"
+    );
+    assert!(
+        nodes_of_type(&tx, "Pin").await.is_empty(),
+        "pin nodes must not survive a bootstrap that declares no wiring"
     );
     assert_eq!(
         sorted_ids(&nodes_of_type(&tx, "Platform").await),
