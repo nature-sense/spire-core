@@ -4,7 +4,7 @@
 //! End-to-end test for the platform/capability seeder
 //! (`MemoryGraphMessage::BootstrapPlatforms`).
 //!
-//! The seeder is a **writer by construction**: this crate does not depend on spire-code, so it
+//! The seeder is a **writer by construction**: this crate does not depend on the caller, so it
 //! cannot walk the registry's tree and consumes instead the flattened `capability_blocks` payload
 //! that side attaches. Being a writer, it never reads back what it wrote — which makes it exactly
 //! the kind of code that runs green while being wrong. A mis-keyed property or a wrong node label
@@ -17,8 +17,8 @@
 //! stale capability is worse than a missing one, because a reader that trusts it is confidently
 //! wrong.
 //!
-//! The payload is synthetic and deliberately small — the real registry is verified on the
-//! spire-code side (its parse/validate tests). What is under test here is the *handler*: node
+//! The payload is synthetic and deliberately small — the real registry is verified by its owner
+//! (its parse/validate tests). What is under test here is the *handler*: node
 //! creation, dedup by path, the three edge kinds, the self-`via` skip, and the deletes.
 
 use serde_json::json;

@@ -39,8 +39,8 @@ use crate::graph::GraphDb;
 use crate::models::embedding::Embedder;
 
 /// Canonical cross-compilation platform definitions cross the crate boundary
-/// as generic JSON (`{ "id", "name", "properties": {flat map} }`); spire-code
-/// owns the typed `Platform` YAML schema + view.
+/// as generic JSON (`{ "id", "name", "properties": {flat map} }`); the typed
+/// `Platform` YAML schema + view live on the caller side of that boundary.
 use crate::models::memory_graph::{
     AttrNode, ContextSearchResult, DistanceScoredNode, GraphEdge, McpConfigFile,
     McpServerConfigEntry, MemoryEntry, MemoryMetadata, NodeUpdate, ProjectSnapshot, ProjectStats,
@@ -322,15 +322,15 @@ pub enum MemoryGraphMessage {
     // ── Platform Config Storage ─────────────────────────
     /// Seed the graph with platform definitions from the platform registry.
     /// Each element is `{ "id", "name", "properties": {flat map} }` — the
-    /// caller (spire-core) owns the platform YAML schema; the graph stores
+    /// caller owns the platform YAML schema; the graph stores
     /// the nodes generically.
-    /// Seed the platform nodes from spire-code's registry. Each entry is
+    /// Seed the platform nodes from the registry the caller passes in. Each entry is
     /// `{ "id", "name", "properties": {flat map} }`, and an entry may also carry a
     /// `"capability_blocks"` key: the entry's declared capabilities, **already flattened** into
     /// `capabilities` (node names), `realizes` (boards) and `provides` (chips) and `carries` (edges,
     /// each with its values), and `pins` (a board's wiring: one entry per declared function, for a
-    /// `Pin` node and a `pins` edge each). Flattened on the other side because it has to be —
-    /// `spire-code` depends on this crate, so this handler cannot walk their tree and is a **writer**
+    /// `Pin` node and a `pins` edge each). Flattened on the other side because it has to be — the
+    /// caller depends on this crate, so this handler cannot walk their tree and is a **writer**
     /// by construction.
     ///
     /// The capability nodes and edges belong here, beside the platform nodes, and must be deleted
@@ -339,14 +339,14 @@ pub enum MemoryGraphMessage {
     /// longer matches it — and a verifier reading a stale truth is worse than one with no truth,
     /// because it is confidently wrong.
     ///
-    /// Full spec, including the test that defines done: spire-code's `ISSUES.md` →
-    /// "The seeder, specified".
+    /// Full spec, including the test that defines done: the seeder spec on the caller
+    /// side ("The seeder, specified").
     BootstrapPlatforms {
         platforms: Vec<serde_json::Value>,
         reply_to: tokio::sync::oneshot::Sender<Result<()>>,
     },
     /// Get all platform definitions from the graph as generic JSON nodes
-    /// (`{ "id", "name", "properties": {flat map} }`); spire-code rebuilds its
+    /// (`{ "id", "name", "properties": {flat map} }`); the caller rebuilds its
     /// typed `Platform` view from the properties.
     GetPlatforms {
         reply_to: tokio::sync::oneshot::Sender<Result<Vec<serde_json::Value>>>,
@@ -1484,7 +1484,7 @@ impl MemoryGraphActor {
 
     /// Serialize a typed `GraphNode::Platform` into the generic JSON shape
     /// `{ "id", "name", "properties": {flat map} }` that crosses the crate
-    /// boundary (spire-code rebuilds its typed `Platform` view from this).
+    /// boundary (the caller rebuilds its typed `Platform` view from this).
     fn platform_node_to_json(node: &AttrNode) -> Option<serde_json::Value> {
         if node.node_type_str() != "Platform" {
             return None;
@@ -3151,7 +3151,7 @@ impl Actor for MemoryGraphActor {
                         actor.store_attr_node_via_gql(&attr, None)?;
                     }
 
-                    // The **capability** nodes and edges, from the flattened blocks spire-code
+                    // The **capability** nodes and edges, from the flattened blocks the caller
                     // attaches as `capability_blocks` (see this message's doc). Deleted first, for the
                     // same reason the platform nodes are: the graph has to mirror the registry, and a
                     // board whose old capabilities survived would be verified against a graph that no
