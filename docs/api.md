@@ -514,7 +514,7 @@ pub struct AttrNode { pub id: String, pub node_type: String, pub subtype: Option
 //                      set_geo_point(Point), set_spatial_geometry(Geometry)
 pub struct NodeUpdate { /* partial update envelope */ }
 pub enum RelationshipType { /* typed relation kinds + Custom(String) */ }
-pub struct RelationshipInput { /* from, to, rel_type, properties */ }
+pub struct RelationshipInput { /* from, to, rel_type, properties (stored, and echoed back on the reply) */ }
 pub struct GraphEdge { /* id, from, to, edge_type, properties */ }
 pub struct SearchOptions { /* filters, limit, embedding-based search flags */ }
 pub struct ContextSearchResult { /* node + score + provenance */ }

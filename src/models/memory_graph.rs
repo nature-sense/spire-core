@@ -387,9 +387,9 @@ pub enum RelationshipType {
     #[serde(rename = "has_diagnostic")]
     HasDiagnostic,
     /// A module `has_edit` an edit record: the typed instruction an edit was run from and what its
-    /// gate did about it. Named rather than left to `Custom` so the predicate round-trips as itself
-    /// — an unnamed one is stored as text and read back as `Unknown`, leaving a history that can be
-    /// walked but not named.
+    /// gate did about it. Named rather than left to `Custom` so the predicate round-trips as a
+    /// *variant* — an unnamed one comes back as the text it was written with, under `Custom`, which
+    /// a query can match by string but no `match` arm can reach and no compiler checks.
     #[serde(rename = "has_edit")]
     HasEdit,
     #[serde(rename = "ast_child")]
@@ -402,8 +402,8 @@ pub enum RelationshipType {
     AstReferences,
     /// The capability edges: a board `realizes` a declared capability, a capability is provided
     /// `via` a chip (the on-board host or a companion), and a board `carries` a companion silicon.
-    /// Without variants for these the predicates are stored as text and read back as `Unknown` -
-    /// edges that exist in the graph and cannot be named, queryable only by their shape.
+    /// Without variants for these the predicates come back as the text they were stored as, under
+    /// `Custom` — edges a query can name by string and no `match` arms can reach.
     #[serde(rename = "realizes")]
     Realizes,
     #[serde(rename = "via")]

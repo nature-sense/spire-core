@@ -99,6 +99,26 @@ fn relationship_type_to_gql_label(rel_type: &RelationshipType) -> String {
     }
 }
 
+/// The inverse of [`relationship_type_to_gql_label`]: the predicate a stored edge label names.
+///
+/// The pair has to be an involution, because the label is the *only* place an unnamed predicate is
+/// kept — [`relationship_type_to_gql_label`] writes `Custom(s)` as `s` precisely so the edge can be
+/// stored at all. Asking serde alone cannot answer this: the enum's `#[serde(other)] Unknown` reports
+/// `Unknown` for **any** label it does not recognise, so `HAS_UNIT` and a label nobody ever wrote are
+/// indistinguishable, and every edge whose predicate was not given a variant is lost to a reader that
+/// matches on predicates — which is exactly how a composition came back readable as a *shape* (16
+/// nodes, 29 edges) but not as a design (`ApplicationSpec { units: [], .. }`).
+///
+/// The `Unknown` arm needs no special case even though its own label would be spelled `Unknown`: a
+/// label is written unquoted into the GQL, and SeleneDB's grammar rejects that word there
+/// (`parse failed: expected label_atom`), so no stored edge ever carries it.
+fn relationship_type_from_gql_label(label: &str) -> RelationshipType {
+    match serde_json::from_value::<RelationshipType>(serde_json::Value::String(label.to_string())) {
+        Ok(known) if !matches!(known, RelationshipType::Unknown) => known,
+        _ => RelationshipType::Custom(label.to_string()),
+    }
+}
+
 // ============================================================================
 
 // MemoryGraphMessage Enum — 14 variants matching IMemoryGraph API
@@ -559,6 +579,58 @@ impl MemoryGraphActor {
         format!("{{{}}}", parts.join(", "))
     }
 
+    /// Build the GQL property parts for an edge written from a `RelationshipInput`: the metadata
+    /// **every** reader requires, plus the caller's own `properties` and `weight`.
+    ///
+    /// The metadata is not optional detail: `parse_edge_from_row` treats `uuid` and `edge_type` as
+    /// mandatory (`?` on each), so an edge stored without them is written to the graph and then
+    /// silently dropped by every read.
+    ///
+    /// The caller's `properties` are rendered one literal each, exactly as
+    /// [`Self::store_capability_edge_via_gql`] renders a capability edge's, so a scalar keeps its
+    /// type and an array/object takes the one encoding the parser accepts (see
+    /// [`Self::format_value_as_gql`]). The three writers that take a `RelationshipInput` used to
+    /// ignore `properties` outright — the RAG ingest names `{domain, relation}` on every edge it
+    /// extracts, and handed both to a writer that never read them. Nothing catches that from the
+    /// read side: the read path reconstructs the non-metadata keys it *finds*, so a key that was
+    /// never stored is indistinguishable from one that was, and only a store that has to hand the
+    /// value back can tell the difference.
+    ///
+    /// `weight`, meanwhile, is still interpolated as **text** (`weight: '0.8'`) although the read
+    /// path accepts only a numeric literal for it, so a stored weight reads back as `None` and every
+    /// caller that passes one (spire-code's startup phases pass 0.7-0.9) has been passing it to the
+    /// void. Kept as-is here on purpose: making it a number changes the type of an existing on-disk
+    /// column, which is a migration decision and not one to take inside a read-back fix (see
+    /// ISSUES.md, "the weight written as text").
+    ///
+    /// Property **keys** are inlined unquoted, as they are everywhere else in this file, so a key
+    /// must spell an identifier for the same reason a predicate must (`domain` and `relation` do):
+    /// the parser sees `my-key: 'v'` as a syntax error, which is the open defect recorded against
+    /// predicates written as bare labels. The four metadata names above belong to the writer, so a
+    /// caller property spelled `uuid`, `edge_type`, `weight` or `created_at` is shadowed here and
+    /// filtered out on the way back.
+    fn edge_props_parts(rel: &RelationshipInput, uuid: &str, created_at: &str) -> Vec<String> {
+        let mut parts: Vec<String> = vec![
+            format!("{}: '{}'", PROP_UUID, Self::gql_escape(uuid)),
+            format!(
+                "{}: '{}'",
+                PROP_EDGE_TYPE,
+                Self::gql_escape(&relationship_type_to_gql_label(&rel.edge_type))
+            ),
+            format!("{}: '{}'", PROP_CREATED_AT, Self::gql_escape(created_at)),
+        ];
+
+        if let Some(weight) = rel.weight {
+            parts.push(format!("{}: '{}'", PROP_WEIGHT, weight));
+        }
+
+        for (key, value) in rel.properties.iter().flatten() {
+            parts.push(format!("{}: {}", key, Self::format_value_as_gql(value)));
+        }
+
+        parts
+    }
+
     /// Format a `serde_json::Value` as a native GQL literal.
     ///
     /// SeleneDB's GQL parser only accepts SCALAR literals in `SET`/`INSERT`
@@ -689,8 +761,7 @@ impl MemoryGraphActor {
 
         let uuid = get_str(PROP_UUID)?;
         let edge_type_str = get_str(PROP_EDGE_TYPE)?;
-        let edge_type = serde_json::from_str::<RelationshipType>(&format!("\"{}\"", edge_type_str))
-            .unwrap_or(RelationshipType::Unknown);
+        let edge_type = relationship_type_from_gql_label(&edge_type_str);
 
         let weight = {
             let db_key = selene_db_core::db_string::DbString::try_from(PROP_WEIGHT).ok()?;
@@ -1054,30 +1125,29 @@ impl MemoryGraphActor {
         })
     }
 
-    /// Store an edge in SeleneDB via GQL.
-
+    /// Store an edge in SeleneDB via GQL, given the property parts [`Self::edge_props_parts`] renders.
     fn store_edge_via_gql(
         &self,
         from_uuid: &str,
         predicate: &str,
         to_uuid: &str,
-        properties: &[(&str, &str)],
+        props: &[String],
     ) -> Result<()> {
         let graph_db = self
             .graph_db
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("GraphDb not initialized"))?;
 
-        // An **empty** props map must be omitted, not written as `{}`: SeleneDB's parser rejects a
+        // An **empty** props list must be omitted, not written as `{}`: SeleneDB's parser rejects a
         // relationship props clause with no identifier in it (`parse failed: expected prop_ident`)
         // - the same family of limitation documented on `format_value_as_gql`. This went unnoticed
         // because the only long-standing caller always passes properties, while every capability
         // edge passes `&[]` - so `realizes`, `via` and `carries` failed to write *every* time,
         // aborting the whole bootstrap on the first edge and leaving nodes with no edges.
-        let props_str = if properties.is_empty() {
+        let props_str = if props.is_empty() {
             String::new()
         } else {
-            format!(" {}", Self::gql_props(properties))
+            format!(" {{{}}}", props.join(", "))
         };
 
         let gql = format!(
@@ -2213,21 +2283,11 @@ impl MemoryGraphActor {
                 let edge_uuid = Uuid::new_v4().to_string();
                 let now = Utc::now();
                 let edge_type_stored = relationship_type_to_gql_label(&rel.edge_type);
-
                 let created_at_str = now.to_rfc3339();
-                let mut edge_props: Vec<(&str, &str)> = vec![
-                    (PROP_UUID, &edge_uuid),
-                    (PROP_EDGE_TYPE, &edge_type_stored),
-                    (PROP_CREATED_AT, &created_at_str),
-                ];
-
-                let weight_str;
-                if let Some(ref weight) = rel.weight {
-                    weight_str = weight.to_string();
-                    edge_props.push((PROP_WEIGHT, &weight_str));
-                }
-
-                let props_str = Self::gql_props(&edge_props);
+                let props_str = format!(
+                    "{{{}}}",
+                    Self::edge_props_parts(rel, &edge_uuid, &created_at_str).join(", ")
+                );
                 let gql = format!(
                     "MATCH (a), (b) WHERE a.uuid = '{}' AND b.uuid = '{}' INSERT (a)-[e:{} {}]->(b)",
                     Self::gql_escape(&rel.from_id),
@@ -2242,7 +2302,7 @@ impl MemoryGraphActor {
                     edge_type: rel.edge_type.clone(),
                     from_id: rel.from_id.clone(),
                     to_id: rel.to_id.clone(),
-                    properties: HashMap::new(),
+                    properties: rel.properties.clone().unwrap_or_default(),
                     created_at: now,
                     weight: rel.weight,
                 }))
@@ -2338,19 +2398,10 @@ impl MemoryGraphActor {
                 let _ = graph_db.execute_gql_write(&delete_gql);
 
                 let created_at_str = now.to_rfc3339();
-                let mut edge_props: Vec<(&str, &str)> = vec![
-                    (PROP_UUID, &edge_uuid),
-                    (PROP_EDGE_TYPE, &edge_type_stored),
-                    (PROP_CREATED_AT, &created_at_str),
-                ];
-
-                let weight_str;
-                if let Some(ref weight) = rel.weight {
-                    weight_str = weight.to_string();
-                    edge_props.push((PROP_WEIGHT, &weight_str));
-                }
-
-                let props_str = Self::gql_props(&edge_props);
+                let props_str = format!(
+                    "{{{}}}",
+                    Self::edge_props_parts(rel, &edge_uuid, &created_at_str).join(", ")
+                );
                 let gql = format!(
                     "MATCH (a), (b) WHERE a.uuid = '{}' AND b.uuid = '{}' INSERT (a)-[e:{} {}]->(b)",
                     Self::gql_escape(&rel.from_id),
@@ -2365,7 +2416,7 @@ impl MemoryGraphActor {
                     edge_type: rel.edge_type.clone(),
                     from_id: rel.from_id.clone(),
                     to_id: rel.to_id.clone(),
-                    properties: HashMap::new(),
+                    properties: rel.properties.clone().unwrap_or_default(),
                     created_at: now,
                     weight: rel.weight,
                 }))
@@ -2649,19 +2700,8 @@ impl Actor for MemoryGraphActor {
                     let edge_uuid = Uuid::new_v4().to_string();
                     let now = Utc::now();
                     let edge_type_stored = relationship_type_to_gql_label(&rel.edge_type);
-
                     let created_at_str = now.to_rfc3339();
-                    let mut edge_props: Vec<(&str, &str)> = vec![
-                        (PROP_UUID, &edge_uuid),
-                        (PROP_EDGE_TYPE, &edge_type_stored),
-                        (PROP_CREATED_AT, &created_at_str),
-                    ];
-
-                    let weight_str;
-                    if let Some(ref weight) = rel.weight {
-                        weight_str = weight.to_string();
-                        edge_props.push((PROP_WEIGHT, &weight_str));
-                    }
+                    let edge_props = Self::edge_props_parts(&rel, &edge_uuid, &created_at_str);
 
                     self.store_edge_via_gql(
                         &rel.from_id,
@@ -2676,7 +2716,7 @@ impl Actor for MemoryGraphActor {
                         edge_type: rel.edge_type,
                         from_id: rel.from_id,
                         to_id: rel.to_id,
-                        properties: HashMap::new(),
+                        properties: rel.properties.unwrap_or_default(),
                         created_at: now,
                         weight: rel.weight,
                     })

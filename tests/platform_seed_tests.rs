@@ -23,7 +23,8 @@
 
 use serde_json::json;
 use spire_core::actors::{Actor, MemoryGraphActor, MemoryGraphMessage};
-use spire_core::models::memory_graph::{AttrNode, GraphEdge};
+use spire_core::models::memory_graph::{AttrNode, GraphEdge, RelationshipInput, RelationshipType};
+use std::collections::HashMap;
 use tokio::sync::{mpsc, oneshot};
 
 /// Spawn a `MemoryGraphActor` over a fresh in-memory graph.
@@ -452,5 +453,189 @@ async fn re_bootstrap_without_blocks_leaves_nothing_behind() {
         survivors.is_empty(),
         "no edge may outlive the nodes it connects: {:?}",
         pairs(&survivors)
+    );
+}
+
+/// Write a node into the store and hand back the id it was stored under.
+async fn store_node(tx: &mpsc::Sender<MemoryGraphMessage>, id: &str) -> String {
+    let now = chrono::Utc::now();
+    let (t, r) = oneshot::channel();
+    tx.send(MemoryGraphMessage::MergeAttrNode {
+        node: AttrNode {
+            id: id.to_string(),
+            node_type: "TestNode".to_string(),
+            subtype: Some("test".to_string()),
+            name: id.to_string(),
+            description: None,
+            properties: Default::default(),
+            embedding_id: None,
+            created_at: now,
+            updated_at: now,
+            version: 1,
+        },
+        reply_to: t,
+    })
+    .await
+    .expect("send merge");
+    r.await.expect("merge reply").expect("merge ok").id
+}
+
+async fn store_edge(
+    tx: &mpsc::Sender<MemoryGraphMessage>,
+    edge_type: RelationshipType,
+    from_id: &str,
+    to_id: &str,
+) {
+    let (t, r) = oneshot::channel();
+    tx.send(MemoryGraphMessage::CreateRelationship {
+        rel: RelationshipInput {
+            edge_type,
+            from_id: from_id.to_string(),
+            to_id: to_id.to_string(),
+            properties: None,
+            weight: None,
+        },
+        reply_to: t,
+    })
+    .await
+    .expect("send rel");
+    r.await.expect("rel reply").expect("rel ok");
+}
+
+/// **A predicate that was not given a variant still comes back as itself**, under `Custom`.
+///
+/// Naming is how the capability edges keep their meaning (see `RelationshipType`), but not every
+/// predicate can be named: a decomposition vocabulary belongs to whoever wrote it, and spire-code's
+/// `HAS_UNIT` / `WIRED_TO` / `HAS_ACTOR` edges are written as `Custom` on purpose. The store keeps
+/// such a predicate in the edge's GQL **label** — the one place the writer puts it — so the reader
+/// that turns a label back into a type has to be the writer's inverse, or the edge survives as a
+/// shape while losing the only thing it means. That is precisely what went wrong: a composition
+/// read back as 16 nodes and 29 edges, and as a design with no units in it.
+///
+/// Asserted against a real store, because a double hands back whatever it was given and so cannot
+/// lose a predicate. Every arm is pinned here — the unnamed predicate, its sibling, and the spelling
+/// that upgrades — so that a future "simplification" of either direction fails here rather than in
+/// whichever reader trusted the label.
+///
+/// A predicate is stored as a bare GQL label, so it must spell a label atom: `_` and case are fine
+/// (`HAS_UNIT`), while a separator or a word the grammar reserves is not. `Unknown` is one of the
+/// latter — `expected label_atom` — which is why the reader needs no special case for it.
+///
+/// The third arm pins the precedence the enum's naming rests on: a predicate spelled like a
+/// variant's `#[serde(rename)]` comes back as **that variant** (`has_edit` → `HasEdit`), not as
+/// `Custom` text, so naming a predicate is a reader-visible upgrade and not a second way to spell it.
+#[tokio::test]
+async fn an_unnamed_predicate_round_trips_as_its_own_text() {
+    let tx = spawn_graph().await;
+    let root = store_node(&tx, "root").await;
+    let child = store_node(&tx, "child").await;
+
+    store_edge(
+        &tx,
+        RelationshipType::Custom("HAS_UNIT".into()),
+        &root,
+        &child,
+    )
+    .await;
+    store_edge(
+        &tx,
+        RelationshipType::Custom("SENDS_TO".into()),
+        &root,
+        &child,
+    )
+    .await;
+    store_edge(
+        &tx,
+        RelationshipType::Custom("has_edit".into()),
+        &root,
+        &child,
+    )
+    .await;
+
+    // Exactly the three edges, each named the way it was written: the unnamed predicate as its own
+    // text, and the predicate that spells a variant as that variant.
+    let mut kinds: Vec<String> = edges_of(&tx, &root)
+        .await
+        .iter()
+        .map(|e| format!("{:?}", e.edge_type))
+        .collect();
+    kinds.sort();
+
+    assert_eq!(
+        kinds,
+        vec![
+            "Custom(\"HAS_UNIT\")".to_string(),
+            "Custom(\"SENDS_TO\")".to_string(),
+            "HasEdit".to_string(),
+        ],
+        "every predicate must survive as the one it was written with"
+    );
+}
+
+/// **The caller's own properties survive the write.**
+///
+/// The predicate above is the half a *reader* matches on; this is the other half a caller hands to
+/// `CreateRelationship` and expects back — `RelationshipInput.properties`, named by the caller (the
+/// RAG ingest writes `{domain, relation}` on every edge it extracts). The writer never read them:
+/// the three writers that take a `RelationshipInput` built their property clause from the metadata
+/// (uuid / edge_type / created_at / weight) and dropped the caller's map on the floor, so both
+/// `domain` and `relation` went into the void on every extracted edge.
+///
+/// Nothing catches that from the read side: the read path reconstructs every non-metadata key it
+/// *finds*, so a key that was never stored is indistinguishable from one that was, and the reply the
+/// caller gets back reported success either way. Only a store that has to hand the value back can
+/// tell the two apart — which is why this asserts the reply *and* a read.
+///
+/// The scalar proves a value passes through as itself; the array proves it takes the one encoding
+/// the parser accepts (`format_value_as_gql`'s JSON-encoded string, decoded back to a list by
+/// `selene_value_to_json` on the way in). `weight` is deliberately not asserted: it is stored as
+/// text while the read path accepts only a numeric literal, a separate defect whose fix changes the
+/// type of an existing on-disk column (see ISSUES.md, "the weight written as text").
+#[tokio::test]
+async fn a_callers_edge_properties_survive_the_write() {
+    let tx = spawn_graph().await;
+    let root = store_node(&tx, "root").await;
+    let child = store_node(&tx, "child").await;
+
+    let (t, r) = oneshot::channel();
+    tx.send(MemoryGraphMessage::CreateRelationship {
+        rel: RelationshipInput {
+            edge_type: RelationshipType::Custom("SENDS_TO".to_string()),
+            from_id: root.clone(),
+            to_id: child.clone(),
+            properties: Some(HashMap::from([
+                ("domain".to_string(), json!("hardware")),
+                ("measurements".to_string(), json!([1, 2, 3])),
+            ])),
+            weight: None,
+        },
+        reply_to: t,
+    })
+    .await
+    .expect("send rel");
+
+    let created = r.await.expect("rel reply").expect("rel ok");
+    assert_eq!(
+        created.properties.get("domain"),
+        Some(&json!("hardware")),
+        "the write must hand the caller back the properties it was given: {:?}",
+        created.properties
+    );
+
+    let edge = edges_of(&tx, &root)
+        .await
+        .into_iter()
+        .find(|e| e.to_id == child)
+        .expect("the edge must be readable");
+    assert_eq!(
+        edge.edge_type,
+        RelationshipType::Custom("SENDS_TO".to_string())
+    );
+    assert_eq!(edge.properties.get("domain"), Some(&json!("hardware")));
+    assert_eq!(
+        edge.properties.get("measurements"),
+        Some(&json!([1, 2, 3])),
+        "an array property must come back structured: {:?}",
+        edge.properties
     );
 }
