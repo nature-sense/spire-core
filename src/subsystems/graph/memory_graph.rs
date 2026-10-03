@@ -104,10 +104,10 @@ fn relationship_type_to_gql_label(rel_type: &RelationshipType) -> String {
 /// The pair has to be an involution, because the label is the *only* place an unnamed predicate is
 /// kept — [`relationship_type_to_gql_label`] writes `Custom(s)` as `s` precisely so the edge can be
 /// stored at all. Asking serde alone cannot answer this: the enum's `#[serde(other)] Unknown` reports
-/// `Unknown` for **any** label it does not recognise, so `HAS_UNIT` and a label nobody ever wrote are
-/// indistinguishable, and every edge whose predicate was not given a variant is lost to a reader that
-/// matches on predicates — which is exactly how a composition came back readable as a *shape* (16
-/// nodes, 29 edges) but not as a design (`ApplicationSpec { units: [], .. }`).
+/// `Unknown` for **any** label it does not recognise, so a caller-defined predicate and a label
+/// nobody ever wrote are indistinguishable, and every edge whose predicate was not given a variant
+/// is lost to a reader that matches on predicates — the edge survives as a shape while losing the
+/// only thing it means.
 ///
 /// The `Unknown` arm needs no special case even though its own label would be spelled `Unknown`: a
 /// label is written unquoted into the GQL, and SeleneDB's grammar rejects that word there
@@ -590,21 +590,19 @@ impl MemoryGraphActor {
     /// [`Self::store_capability_edge_via_gql`] renders a capability edge's, so a scalar keeps its
     /// type and an array/object takes the one encoding the parser accepts (see
     /// [`Self::format_value_as_gql`]). The three writers that take a `RelationshipInput` used to
-    /// ignore `properties` outright — the RAG ingest names `{domain, relation}` on every edge it
-    /// extracts, and handed both to a writer that never read them. Nothing catches that from the
-    /// read side: the read path reconstructs the non-metadata keys it *finds*, so a key that was
-    /// never stored is indistinguishable from one that was, and only a store that has to hand the
-    /// value back can tell the difference.
+    /// ignore `properties` outright — a caller that named its own keys handed them to a writer that
+    /// never read them. Nothing catches that from the read side: the read path reconstructs the
+    /// non-metadata keys it *finds*, so a key that was never stored is indistinguishable from one
+    /// that was, and only a store that has to hand the value back can tell the difference.
     ///
     /// `weight`, meanwhile, is still interpolated as **text** (`weight: '0.8'`) although the read
     /// path accepts only a numeric literal for it, so a stored weight reads back as `None` and every
-    /// caller that passes one (spire-code's startup phases pass 0.7-0.9) has been passing it to the
-    /// void. Kept as-is here on purpose: making it a number changes the type of an existing on-disk
-    /// column, which is a migration decision and not one to take inside a read-back fix (see
-    /// ISSUES.md, "the weight written as text").
+    /// caller that passes one has been passing it to the void. Kept as-is here on purpose: making it
+    /// a number changes the type of an existing on-disk column, which is a migration decision and
+    /// not one to take inside a read-back fix (see ISSUES.md, "the weight written as text").
     ///
     /// Property **keys** are inlined unquoted, as they are everywhere else in this file, so a key
-    /// must spell an identifier for the same reason a predicate must (`domain` and `relation` do):
+    /// must spell an identifier for the same reason a predicate must (`kind` and `name` do):
     /// the parser sees `my-key: 'v'` as a syntax error, which is the open defect recorded against
     /// predicates written as bare labels. The four metadata names above belong to the writer, so a
     /// caller property spelled `uuid`, `edge_type`, `weight` or `created_at` is shadowed here and

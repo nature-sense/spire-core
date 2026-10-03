@@ -505,12 +505,10 @@ async fn store_edge(
 /// **A predicate that was not given a variant still comes back as itself**, under `Custom`.
 ///
 /// Naming is how the capability edges keep their meaning (see `RelationshipType`), but not every
-/// predicate can be named: a decomposition vocabulary belongs to whoever wrote it, and spire-code's
-/// `HAS_UNIT` / `WIRED_TO` / `HAS_ACTOR` edges are written as `Custom` on purpose. The store keeps
-/// such a predicate in the edge's GQL **label** — the one place the writer puts it — so the reader
-/// that turns a label back into a type has to be the writer's inverse, or the edge survives as a
-/// shape while losing the only thing it means. That is precisely what went wrong: a composition
-/// read back as 16 nodes and 29 edges, and as a design with no units in it.
+/// predicate can be named: a caller-defined vocabulary is written as `Custom` on purpose. The store
+/// keeps such a predicate in the edge's GQL **label** — the one place the writer puts it — so the
+/// reader that turns a label back into a type has to be the writer's inverse, or the edge survives
+/// as a shape while losing the only thing it means.
 ///
 /// Asserted against a real store, because a double hands back whatever it was given and so cannot
 /// lose a predicate. Every arm is pinned here — the unnamed predicate, its sibling, and the spelling
@@ -518,7 +516,7 @@ async fn store_edge(
 /// whichever reader trusted the label.
 ///
 /// A predicate is stored as a bare GQL label, so it must spell a label atom: `_` and case are fine
-/// (`HAS_UNIT`), while a separator or a word the grammar reserves is not. `Unknown` is one of the
+/// (`RELATES_TO`), while a separator or a word the grammar reserves is not. `Unknown` is one of the
 /// latter — `expected label_atom` — which is why the reader needs no special case for it.
 ///
 /// The third arm pins the precedence the enum's naming rests on: a predicate spelled like a
@@ -532,14 +530,14 @@ async fn an_unnamed_predicate_round_trips_as_its_own_text() {
 
     store_edge(
         &tx,
-        RelationshipType::Custom("HAS_UNIT".into()),
+        RelationshipType::Custom("RELATES_TO".into()),
         &root,
         &child,
     )
     .await;
     store_edge(
         &tx,
-        RelationshipType::Custom("SENDS_TO".into()),
+        RelationshipType::Custom("CONNECTS_TO".into()),
         &root,
         &child,
     )
@@ -564,8 +562,8 @@ async fn an_unnamed_predicate_round_trips_as_its_own_text() {
     assert_eq!(
         kinds,
         vec![
-            "Custom(\"HAS_UNIT\")".to_string(),
-            "Custom(\"SENDS_TO\")".to_string(),
+            "Custom(\"CONNECTS_TO\")".to_string(),
+            "Custom(\"RELATES_TO\")".to_string(),
             "HasEdit".to_string(),
         ],
         "every predicate must survive as the one it was written with"
@@ -575,11 +573,10 @@ async fn an_unnamed_predicate_round_trips_as_its_own_text() {
 /// **The caller's own properties survive the write.**
 ///
 /// The predicate above is the half a *reader* matches on; this is the other half a caller hands to
-/// `CreateRelationship` and expects back — `RelationshipInput.properties`, named by the caller (the
-/// RAG ingest writes `{domain, relation}` on every edge it extracts). The writer never read them:
-/// the three writers that take a `RelationshipInput` built their property clause from the metadata
-/// (uuid / edge_type / created_at / weight) and dropped the caller's map on the floor, so both
-/// `domain` and `relation` went into the void on every extracted edge.
+/// `CreateRelationship` and expects back — `RelationshipInput.properties`, the caller's own keys and
+/// values. The writer never read them: the three writers that take a `RelationshipInput` built their
+/// property clause from the metadata (uuid / edge_type / created_at / weight) and dropped the
+/// caller's map on the floor, so every key the caller named went into the void.
 ///
 /// Nothing catches that from the read side: the read path reconstructs every non-metadata key it
 /// *finds*, so a key that was never stored is indistinguishable from one that was, and the reply the
@@ -600,11 +597,11 @@ async fn a_callers_edge_properties_survive_the_write() {
     let (t, r) = oneshot::channel();
     tx.send(MemoryGraphMessage::CreateRelationship {
         rel: RelationshipInput {
-            edge_type: RelationshipType::Custom("SENDS_TO".to_string()),
+            edge_type: RelationshipType::Custom("RELATES_TO".to_string()),
             from_id: root.clone(),
             to_id: child.clone(),
             properties: Some(HashMap::from([
-                ("domain".to_string(), json!("hardware")),
+                ("kind".to_string(), json!("hardware")),
                 ("measurements".to_string(), json!([1, 2, 3])),
             ])),
             weight: None,
@@ -616,7 +613,7 @@ async fn a_callers_edge_properties_survive_the_write() {
 
     let created = r.await.expect("rel reply").expect("rel ok");
     assert_eq!(
-        created.properties.get("domain"),
+        created.properties.get("kind"),
         Some(&json!("hardware")),
         "the write must hand the caller back the properties it was given: {:?}",
         created.properties
@@ -629,9 +626,9 @@ async fn a_callers_edge_properties_survive_the_write() {
         .expect("the edge must be readable");
     assert_eq!(
         edge.edge_type,
-        RelationshipType::Custom("SENDS_TO".to_string())
+        RelationshipType::Custom("RELATES_TO".to_string())
     );
-    assert_eq!(edge.properties.get("domain"), Some(&json!("hardware")));
+    assert_eq!(edge.properties.get("kind"), Some(&json!("hardware")));
     assert_eq!(
         edge.properties.get("measurements"),
         Some(&json!([1, 2, 3])),
