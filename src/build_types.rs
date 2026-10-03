@@ -61,16 +61,14 @@ pub struct BuildMetadata {
     /// the default. Empty when the project builds on one platform only.
     #[serde(default)]
     pub platform_targets: Vec<String>,
-    /// The project's structural shape (Native / SingleSource / Hal). Filled by
-    /// the analyzer; the UI uses it to choose the project-tree presentation
-    /// (filesystem subprojects vs virtual component view for HAL projects).
+    /// The project's structural shape (one of the [`ProjectStructure`] variants),
+    /// serialized as its snake_case key unless it is the default (`native`).
     #[serde(default, skip_serializing_if = "is_native_structure")]
     pub structure: ProjectStructure,
     /// Named, independently-addressable slices of a composite project. For the
     /// Hal shape these are `common` (shared toolkit + HAL contracts) and one
     /// platform domain per target (`rpi5`, `rock3c` — app code + that
-    /// platform's HAL implementation). Selecting a domain in the UI sets the
-    /// LLM edit context and its editability constraints.
+    /// platform's HAL implementation).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub domains: Vec<ProjectDomain>,
     /// Backward-compat fields (expected by build parsers)
@@ -158,9 +156,7 @@ pub enum SourceKind {
 ///
 /// Meson cross-platform projects compose shared toolkit code, a platform
 /// implementation of the HAL contract, and platform application code into one
-/// executable. Keeping these roles first-class lets the product model separate
-/// "the contract" from "this platform's implementation" instead of flattening
-/// everything into one soup.
+/// executable.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceRole {
@@ -175,9 +171,8 @@ pub enum SourceRole {
     Shared,
 }
 
-/// The structural shape of a new cross-platform project. Selected in the
-/// new-project wizard BEFORE planning — it determines which scaffold the build
-/// module emits and how the fill phase classifies sources.
+/// The structural shape of a project, stated by a declaration in its build files rather than
+/// inferred from its layout.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectStructure {
@@ -188,69 +183,50 @@ pub enum ProjectStructure {
     /// via `if platform` — no HAL contract.
     SingleSource,
     /// Meson: shared core + `hal/api/*.hpp` contract + per-platform
-    /// implementations + per-target build (the ai-traps shape).
+    /// implementations + per-target build.
     Hal,
     /// Rust/SwiftUI monorepo built on the Spire framework: a Cargo workspace
     /// (`crates/spire-<name>` crate) plus a host SwiftUI app (`ui/swift`),
     /// with `spire-actor` + `spire-core` as sibling path dependencies. Host
     /// (macOS) only.
     SpireApp,
-    /// The **`spire-embedded` container**: a Cargo workspace holding the on-device side of a
-    /// firmware family — the **actor framework**, one **BSP** crate per board that needs one, and
-    /// the **peripheral drivers** — all written against `embedded-hal`'s traits and, where board
-    /// facts are involved, the vendor's HAL (`esp-hal`). There is **one** of these, not one per
-    /// application: applications depend on it rather than containing it.
+    /// A firmware container: a Cargo workspace holding the on-device side of a firmware family —
+    /// the actor framework, one BSP crate per board that needs one, and the peripheral drivers —
+    /// all written against `embedded-hal`'s traits and, where board facts are involved, the
+    /// vendor's HAL (`esp-hal`). Applications depend on it rather than containing it.
     ///
-    /// Scaffolded and maintained **by spire-code**, which is also what adds to it — a BSP crate for
-    /// a board with no upstream BSP, a driver for a device with no upstream crate, an actor. The
-    /// default is the ecosystem's crate; this project holds what the ecosystem does not.
-    ///
-    /// Recognized by a **declaration**, not a layout guess: the workspace manifest carries
-    /// `[workspace.metadata.spire] structure = "embedded"`. A layout that happens to look
-    /// like this one is not this project type, and the layout is a consequence of the structure
-    /// rather than its definition.
+    /// Recognized by a declaration: the workspace manifest carries
+    /// `[workspace.metadata.spire] structure = "embedded"`.
     Embedded,
-    /// Embedded **application**: a Rust binary for one board that *depends on* a
-    /// [`ProjectStructure::Embedded`] project — plus the vendor's HAL and whichever driver crates it
-    /// uses.
+    /// Embedded application: a Rust binary for one board that *depends on* an
+    /// [`ProjectStructure::Embedded`] project — plus the vendor's HAL and whichever driver crates
+    /// it uses.
     ///
     /// A structure of its own rather than a flag on `Embedded`, because the two are separate
-    /// **projects**, and because the counts differ: the container is a single library, and
-    /// applications are many. An application is a crate with a `main`; the container is a workspace
-    /// of libraries; an application is built *against* one rather than containing it.
+    /// projects: an application is a crate with a `main`, the container is a workspace of
+    /// libraries, and the application is built *against* it rather than containing it.
     ///
-    /// Recognized by a declaration too, and for the same reason: `[package.metadata.spire]` carries
-    /// `structure = "embedded_app"` **and** the `embedded_path` it was built against, so the
-    /// dependency is a recorded fact rather than something a later reader has to infer from `../` in
-    /// a path.
+    /// Recognized by a declaration too: `[package.metadata.spire]` carries
+    /// `structure = "embedded_app"` **and** the `embedded_path` it was built against.
     EmbeddedApp,
-    /// **An ESP-IDF component library**: a project whose product is `components/*` — protocol
-    /// drivers, board support packages, and the framework they share — so that applications depend
-    /// on it rather than containing it.
+    /// An ESP-IDF component library: a project whose product is `components/*` — protocol
+    /// drivers, board support packages, and the framework they share. Applications depend on it
+    /// rather than containing it.
     ///
-    /// The C++/ESP-IDF counterpart of [`ProjectStructure::Embedded`], and deliberately *simpler*:
-    /// on ESP-IDF there is no separate HAL to invent, because IDF already is one, and no BSP
-    /// concept to model, because a board's BSP is a component like any other. What a firmware
-    /// family accumulates is a **catalogue of components**, and that is the whole of this type.
-    ///
-    /// It holds **no actors and no application entry point**. `main/` exists only so
-    /// `idf.py build` compile-checks the components; the actors that use them live in an
+    /// It holds no actors and no application entry point. `main/` exists only so `idf.py build`
+    /// compile-checks the components; the actors that use them live in an
     /// [`ProjectStructure::IdfApplication`].
     ///
-    /// Recognized by a **declaration**, not a layout guess: the root `CMakeLists.txt` carries
+    /// Recognized by a declaration: the root `CMakeLists.txt` carries
     /// `set(SPIRE_PROJECT_STRUCTURE idf_library)`.
     IdfLibrary,
-    /// **An ESP-IDF application**: a project with `main/`, the actors and the wiring, built
-    /// against one or more [`ProjectStructure::IdfLibrary`] projects.
+    /// An ESP-IDF application: a project with `main/`, the actors and the wiring, built against
+    /// one or more [`ProjectStructure::IdfLibrary`] projects.
     ///
-    /// The split is the point. A library holds what is reusable and knows nothing about any
-    /// particular product; an application holds the **composition** — which components are used,
-    /// how the actors are wired, and the board facts (pins, bus, addresses) that turn a shelf of
-    /// parts into a device. Making a library into an application is how a second product begins by
-    /// copying the first, which is the thing this split exists to prevent.
+    /// An application holds the composition — which components are used, how the actors are wired,
+    /// and the board facts (pins, bus, addresses) — while a library holds only what is reusable.
     ///
-    /// Declared the same way, and for the same reason:
-    /// `set(SPIRE_PROJECT_STRUCTURE idf_application)`.
+    /// Declared by `set(SPIRE_PROJECT_STRUCTURE idf_application)`.
     IdfApplication,
 }
 
@@ -271,8 +247,7 @@ impl ProjectStructure {
         }
     }
 
-    /// Parse a wizard/FFI structure key; unknown or empty falls back to the
-    /// default (Native), matching how unknown config previously behaved.
+    /// Parse a structure key; an unknown or empty string falls back to the default (Native).
     pub fn from_str(s: &str) -> ProjectStructure {
         match s {
             "single_source" => ProjectStructure::SingleSource,
@@ -314,20 +289,19 @@ pub struct HalInterface {
     pub implementations: Vec<String>,
 }
 
-/// What the LLM may do inside a domain (used for context-constrained edits).
+/// The edit constraint on a domain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DomainEditability {
-    /// Read-only: contract headers — change via the HAL tools, never a raw edit.
+    /// Read-only: contract headers.
     ReadOnly,
     /// Shared: changing this affects every platform (toolkit).
     Shared,
-    /// Fillable: safe to implement/modify for this platform only.
+    /// Fillable: implement/modify for this platform only.
     Fillable,
 }
 
-/// A named slice of a composite project — the unit the UI selects and the LLM
-/// edits within. See `BuildMetadata::domains`.
+/// A named slice of a composite project. See `BuildMetadata::domains`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectDomain {
     /// Stable id, e.g. "common", "rpi5", "rock3c".
@@ -347,7 +321,7 @@ pub struct ProjectDomain {
     /// The normalized build invocation when this domain is a platform target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_spec: Option<BuildSpec>,
-    /// Editability constraint for LLM modifications within this domain.
+    /// Editability constraint within this domain.
     #[serde(default = "default_fillable")]
     pub editability: DomainEditability,
     /// For the common domain: contract stems this domain owns (read-only).
@@ -464,10 +438,8 @@ pub struct McpServerCapability {
 
 /// The union of build-config file names owned by every registered build module.
 ///
-/// Single source of truth for config-file discovery. Shared: lives in
-/// `spire-core` (the analyzer uses it); the build modules in `spire-code` own
-/// the per-module definitions. Adding a new build module means adding its
-/// config files here (and in the module itself).
+/// Single source of truth for config-file discovery. Adding a build module means
+/// adding its config files here.
 pub fn all_config_file_names() -> Vec<&'static str> {
     vec![
         // Cargo
