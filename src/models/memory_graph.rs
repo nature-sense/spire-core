@@ -422,6 +422,17 @@ pub enum RelationshipType {
     /// graph rather than only in the registry seed beside it.
     #[serde(rename = "pins")]
     Pins,
+    /// A board `devices` a declared **part**: the edge from the board to a `Device` node (the name an
+    /// application's `resources:` refers to — `display`, `rtc`), carrying that device's own values
+    /// (`part`, `bus`, `address`). The counterpart of `pins`, one layer up: `pins` says how a function
+    /// is wired, `devices` says which part it is.
+    #[serde(rename = "devices")]
+    Devices,
+    /// A device's `role` edge: the capability the part *is* (`media.display`, `timekeeping.rtc`),
+    /// from the `Device` node to the capability node. A device whose role the vocabulary does not name
+    /// is refused before it is written, so this edge never points at nothing.
+    #[serde(rename = "role")]
+    Role,
     Custom(String),
     #[serde(other)]
     Unknown,

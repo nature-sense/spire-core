@@ -3168,6 +3168,11 @@ impl Actor for MemoryGraphActor {
                     let _ = graph_db.execute_gql_write(
                         "MATCH (n:SpireNode) WHERE n.node_type = 'Pin' DETACH DELETE n",
                     );
+                    // And the **device** nodes: a board's parts are board facts with a node of their
+                    // own (`Device`, one per `devices:` name), so they mirror the registry too.
+                    let _ = graph_db.execute_gql_write(
+                        "MATCH (n:SpireNode) WHERE n.node_type = 'Device' DETACH DELETE n",
+                    );
                     // One node per capability path, **deduped in-process before writing**. The same
                     // path is declared by a chip *and* by the board built on it - `media.display` on
                     // the P4 and on the P4-Nano - and the store does not dedup for us: storing the
@@ -3349,6 +3354,80 @@ impl Actor for MemoryGraphActor {
                                 .unwrap_or_default();
                             actor
                                 .store_capability_edge_via_gql(board_id, "pins", &pin_id, &props)?;
+                        }
+                        // And the board's **parts**: one `Device` node per declared `devices:` name —
+                        // the name an application's `resources:` refers to — with a `devices` edge from
+                        // the board carrying the part's own values (`part`, `bus`, `address`), and a
+                        // `role` edge from the device to each capability it *is* (`media.display`, or
+                        // both `sensing.temperature` and `sensing.humidity` for an SHT20). The role
+                        // nodes already exist: `seeder_input` names every device role as a capability,
+                        // so a `role` edge never points at nothing. The id is board-scoped, like a
+                        // pin's: `display` on two boards is two parts, never one.
+                        for device in blocks
+                            .get("devices")
+                            .and_then(|v| v.as_array())
+                            .into_iter()
+                            .flatten()
+                        {
+                            let Some(name) = device.get("device").and_then(|v| v.as_str()) else {
+                                continue;
+                            };
+                            let device_id = format!("{board_id}/devices/{name}");
+                            let now = Utc::now();
+                            let attr = AttrNode {
+                                id: device_id.clone(),
+                                node_type: "Device".to_string(),
+                                subtype: None,
+                                name: name.to_string(),
+                                description: None,
+                                properties: HashMap::new(),
+                                embedding_id: None,
+                                created_at: now,
+                                updated_at: now,
+                                version: 1,
+                            };
+                            actor.store_attr_node_via_gql(&attr, None)?;
+
+                            let props = device
+                                .get("properties")
+                                .and_then(|v| v.as_object())
+                                .cloned()
+                                .unwrap_or_default();
+                            actor.store_capability_edge_via_gql(
+                                board_id, "devices", &device_id, &props,
+                            )?;
+
+                            // The capabilities the part *is*: one `role` edge per name, so a multi-role
+                            // part (the SHT20 is temperature *and* humidity) is one node with an edge to
+                            // each capability. A role edge carries no values of its own — the part's
+                            // values ride the `devices` edge, and a capability node is identity only, so
+                            // the same `media.display` is one node shared by every board that declares
+                            // it. The legacy scalar `role:` is accepted too, so a payload written before
+                            // the multi-role shape still seeds.
+                            let roles: Vec<String> = device
+                                .get("roles")
+                                .and_then(|v| v.as_array())
+                                .map(|list| {
+                                    list.iter()
+                                        .filter_map(|v| v.as_str())
+                                        .map(str::to_string)
+                                        .collect()
+                                })
+                                .or_else(|| {
+                                    device
+                                        .get("role")
+                                        .and_then(|v| v.as_str())
+                                        .map(|role| vec![role.to_string()])
+                                })
+                                .unwrap_or_default();
+                            for role in roles {
+                                actor.store_capability_edge_via_gql(
+                                    &device_id,
+                                    "role",
+                                    &role,
+                                    &serde_json::Map::new(),
+                                )?;
+                            }
                         }
                     }
                     self.schedule_snapshot();

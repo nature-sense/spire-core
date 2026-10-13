@@ -160,7 +160,14 @@ fn registry() -> Vec<serde_json::Value> {
             "name": "Waveshare ESP32-P4-Nano",
             "properties": {"family": "esp32"},
             "capability_blocks": {
-                "capabilities": ["media.display", "radio.wifi"],
+                "capabilities": [
+                    "media.display",
+                    "radio.wifi",
+                    // A part the board carries with **two** capabilities at once (the SHT20): both
+                    // names exist as capability nodes, so both of the device's `role` edges land.
+                    "sensing.temperature",
+                    "sensing.humidity",
+                ],
                 "realizes": [
                     {
                         "capability": "media.display",
@@ -181,6 +188,28 @@ fn registry() -> Vec<serde_json::Value> {
                 // Wiring flattens to one entry per declared **function** — the shape `seeder_input`
                 // produces — for a `Pin` node and a `pins` edge each.
                 "pins": [{"function": "i2c", "properties": {"sda": "GPIO7"}}],
+                // And the parts the board carries, in the shape `seeder_input` produces: the name
+                // for the `Device` node, the `roles` for the edges to the capabilities it *is*, and
+                // the rest (`part`, `bus`) for the `devices` edge's values. Every role is already a
+                // declared capability, so the `role` edges point at nodes that exist — including the
+                // SHT20's **two**, one device that is temperature *and* humidity at once.
+                "devices": [
+                    {
+                        "device": "display",
+                        "roles": ["media.display"],
+                        "properties": {"part": "ILI9342C", "bus": "display"},
+                    },
+                    {
+                        "device": "wifi",
+                        "roles": ["radio.wifi"],
+                        "properties": {"part": "esp32c5", "bus": "sdio"},
+                    },
+                    {
+                        "device": "sht20",
+                        "roles": ["sensing.temperature", "sensing.humidity"],
+                        "properties": {"part": "SHT20", "bus": "i2c"},
+                    },
+                ],
             }
         }),
     ]
@@ -201,7 +230,7 @@ async fn bootstrap_seeds_capability_nodes_and_edges() {
 
     // The union of every path, **deduped**: `media.display` is declared by both the chip and the
     // board and `radio.wifi` by both a chip and the board, so a seeder keying nodes on anything
-    // but the path would show 11 here instead of 7.
+    // but the path would show 11 here instead of 9.
     let caps = nodes_of_type(&tx, "Capability").await;
     assert_eq!(
         sorted_ids(&caps),
@@ -213,6 +242,9 @@ async fn bootstrap_seeds_capability_nodes_and_edges() {
             "radio",
             "radio.bluetooth",
             "radio.wifi",
+            // The SHT20's two roles — one board-declared part whose `role` edges need both nodes.
+            "sensing.humidity",
+            "sensing.temperature",
         ],
         "one node per distinct capability path, deduped across chips and boards"
     );
@@ -411,6 +443,78 @@ async fn wiring_is_its_own_node_and_edge() {
     );
 }
 
+/// A board's **parts** become their own nodes and edges, one layer above wiring: a `Device` node per
+/// declared name (board-scoped, so `display` on two boards is two parts), a `devices` edge from the
+/// board carrying the part's own values (`part`, `bus`), and a `role` edge from the device to **each**
+/// capability it *is* — one per role, so a multi-role part is one node with several edges. Both edge
+/// kinds must read back **named** — an edge findable only by shape is not one a caller can ask for —
+/// and a `role` edge must land on a capability node that exists, since the read side resolves an
+/// application's `resources:` through it.
+#[tokio::test]
+async fn bootstrap_seeds_device_nodes_with_roles() {
+    let tx = spawn_graph().await;
+    bootstrap(&tx, registry()).await;
+
+    let board = "waveshare-esp32-p4-nano";
+    let devices = nodes_of_type(&tx, "Device").await;
+    assert_eq!(
+        sorted_ids(&devices),
+        vec![
+            format!("{board}/devices/display"),
+            format!("{board}/devices/sht20"),
+            format!("{board}/devices/wifi"),
+        ],
+        "one node per declared part, board-scoped"
+    );
+    assert_eq!(devices[0].name, "display", "the node is named by the part");
+
+    // The board -devices-> part edge carries that part's own values, minus its name (the edge's
+    // endpoint) — the same division of labour a `pins` edge and a `Pin` node have.
+    let board_edges = edges_of(&tx, board).await;
+    let display_id = format!("{board}/devices/display");
+    let display =
+        props_of(&board_edges, board, &display_id).expect("the board declares a display part");
+    assert_eq!(display["part"], json!("ILI9342C"));
+    assert_eq!(display["bus"], json!("display"));
+
+    // The role is a second edge, out of the *device* node, to the capability the part is.
+    let device_edges = edges_of(&tx, &display_id).await;
+    assert!(
+        has_pair(&device_edges, &display_id, "media.display"),
+        "device -role-> capability: {:?}",
+        pairs(&device_edges)
+    );
+
+    // A **multi-role** part is one `Device` node with an edge to *each* capability it is: the SHT20 is
+    // temperature and humidity, so both `role` edges come out of the one node, and neither capability
+    // is a property of the other.
+    let sht20_id = format!("{board}/devices/sht20");
+    let sht20_edges = edges_of(&tx, &sht20_id).await;
+    assert!(
+        has_pair(&sht20_edges, &sht20_id, "sensing.temperature")
+            && has_pair(&sht20_edges, &sht20_id, "sensing.humidity"),
+        "one device, two `role` edges: {:?}",
+        pairs(&sht20_edges)
+    );
+
+    let kinds: std::collections::BTreeSet<String> = board_edges
+        .iter()
+        .map(|e| format!("{:?}", e.edge_type))
+        .collect();
+    assert!(
+        kinds.contains("Devices"),
+        "`devices` must read back named: {kinds:?}"
+    );
+    let role_kinds: std::collections::BTreeSet<String> = device_edges
+        .iter()
+        .map(|e| format!("{:?}", e.edge_type))
+        .collect();
+    assert!(
+        role_kinds.contains("Role"),
+        "`role` must read back named: {role_kinds:?}"
+    );
+}
+
 #[tokio::test]
 async fn re_bootstrap_without_blocks_leaves_nothing_behind() {
     let tx = spawn_graph().await;
@@ -438,6 +542,10 @@ async fn re_bootstrap_without_blocks_leaves_nothing_behind() {
     assert!(
         nodes_of_type(&tx, "Pin").await.is_empty(),
         "pin nodes must not survive a bootstrap that declares no wiring"
+    );
+    assert!(
+        nodes_of_type(&tx, "Device").await.is_empty(),
+        "device nodes must not survive a bootstrap that declares no parts"
     );
     assert_eq!(
         sorted_ids(&nodes_of_type(&tx, "Platform").await),
