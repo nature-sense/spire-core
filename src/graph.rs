@@ -23,9 +23,10 @@ use selene_db_graph::store::RowIndex;
 use selene_db_graph::vector_index::VectorIndexKind;
 use selene_db_graph::vector_search::VectorNodeSearchHit;
 use selene_db_graph::write_txn::WriteTxn;
+use selene_db_graph::CORE_PROVIDER_TAG;
 use selene_db_persist::{
-    find_latest_snapshot, snapshot_path, SectionCompression, SnapshotConfig,
-    SnapshotFinalizeOutcome, WalConfig,
+    find_latest_snapshot, snapshot_path, Manifest, SectionCompression, SnapshotConfig,
+    SnapshotFinalizeOutcome, DEFAULT_WAL_FILE_NAME, WalConfig,
 };
 
 /// Type for SeleneDB write transactions.
@@ -618,6 +619,160 @@ impl GraphDb {
     pub fn snapshot_path(dir: impl AsRef<Path>, sequence: u64) -> PathBuf {
         snapshot_path(dir.as_ref(), sequence)
     }
+
+    /// Whether the underlying graph is WAL-backed (has a durable CORE provider).
+    pub fn is_wal_backed(&self) -> bool {
+        !self.shared.durable_providers().is_empty()
+    }
+
+    /// Get the WAL high-water mark (last committed sequence), or 0 when the
+    /// graph is not WAL-backed or has no committed changes yet.
+    ///
+    /// The CORE durable provider surfaces this via [`DurableProvider::flush`],
+    /// which also forces the WAL to stable storage first — exactly the barrier
+    /// a checkpoint wants before writing a snapshot.
+    pub fn wal_last_sequence(&self) -> Result<u64> {
+        for provider in self.shared.durable_providers() {
+            if provider.provider_tag().0 == CORE_PROVIDER_TAG {
+                if let Some(seq) = provider
+                    .flush()
+                    .map_err(|e| anyhow::anyhow!("WAL flush failed: {e}"))?
+                {
+                    return Ok(seq);
+                }
+            }
+        }
+        Ok(0)
+    }
+
+    /// Write a checkpoint: a full-dump snapshot at the WAL high-water mark plus
+    /// the MANIFEST epoch that names it.
+    ///
+    /// Tying the snapshot sequence to [`Self::wal_last_sequence`] is what keeps
+    /// crash recovery correct: a full dump at sequence `S` captures every WAL
+    /// entry `<= S`, and recovery replays only entries `> S`. The MANIFEST makes
+    /// recovery treat `S` as authoritative and skip the legacy WAL/snapshot
+    /// epoch cross-check, which otherwise hard-fails whenever the (never
+    /// rotated) WAL header lags the snapshot sequence.
+    ///
+    /// Returns `Ok(None)` when there is nothing new to checkpoint (no committed
+    /// WAL changes, or the current high-water mark is already snapshotted).
+    pub fn checkpoint(
+        &self,
+        dir: impl AsRef<Path>,
+        fsync: bool,
+    ) -> Result<Option<SnapshotFinalizeOutcome>> {
+        let dir = dir.as_ref();
+
+        if !self.is_wal_backed() {
+            // In-memory graph: no WAL epoch to reconcile, so keep the legacy
+            // file-counter sequence and write no MANIFEST.
+            let next_seq = match GraphDb::latest_snapshot_sequence(dir)? {
+                Some(seq) => seq + 1,
+                None => 1,
+            };
+            return self.write_snapshot_if_absent(dir, next_seq, fsync);
+        }
+
+        let seq = self.wal_last_sequence()?;
+        if seq == 0 {
+            return Ok(None);
+        }
+
+        let outcome = self.write_snapshot_if_absent(dir, seq, fsync)?;
+
+        Manifest {
+            live_snapshot_seq: seq,
+            active_wal_header_seq: seq,
+            compaction_epoch: 0,
+            active_wal: DEFAULT_WAL_FILE_NAME.to_string(),
+            archived_wal_seqs: Vec::new(),
+        }
+        .write_atomic(dir)
+        .map_err(|e| anyhow::anyhow!("Failed to write MANIFEST: {e}"))?;
+
+        Ok(outcome)
+    }
+
+    /// Write a snapshot at `seq` unless it already exists.
+    ///
+    /// The debounced snapshot task and an explicit `Sync` can race to the same
+    /// WAL high-water mark; the loser observes the winner's file and treats the
+    /// snapshot as already durable.
+    fn write_snapshot_if_absent(
+        &self,
+        dir: &Path,
+        seq: u64,
+        fsync: bool,
+    ) -> Result<Option<SnapshotFinalizeOutcome>> {
+        let path = GraphDb::snapshot_path(dir, seq);
+        if path.exists() {
+            return Ok(None);
+        }
+        match self.write_snapshot(dir, seq, fsync) {
+            Ok(outcome) => Ok(Some(outcome)),
+            Err(err) => {
+                if path.exists() {
+                    Ok(None)
+                } else {
+                    Err(err)
+                }
+            }
+        }
+    }
+
+    /// Advance the WAL by one commit without leaving a node behind, so a
+    /// freshly recovered WAL (whose counter reset to 0) can be unified with the
+    /// recovered data before the first checkpoint.
+    pub fn touch_commit(&self) -> Result<()> {
+        let id = format!("recovery-touch-{}", uuid::Uuid::new_v4());
+        let now = chrono::Utc::now().to_rfc3339();
+        let insert = format!(
+            "INSERT (n:SpireNode {{uuid: '{}', node_type: 'Touch', name: 'recovery-touch', updated_at: '{}'}})",
+            id, now
+        );
+        self.execute_gql_write(&insert)?;
+        let delete = format!("MATCH (n:SpireNode) WHERE n.uuid = '{}' DETACH DELETE n", id);
+        self.execute_gql_write(&delete)?;
+        Ok(())
+    }
+
+    /// Re-baseline after a WAL/snapshot mismatch: advance the fresh WAL, write
+    /// an authoritative snapshot at the WAL high-water mark, publish the
+    /// MANIFEST, and drop the now-redundant older snapshots.
+    pub fn rebaseline_after_recovery(&self, dir: &Path) -> Result<()> {
+        self.touch_commit()?;
+        let seq = self.wal_last_sequence()?;
+        if seq == 0 {
+            return Ok(());
+        }
+        // Remove the stale snapshot at this sequence (old divergent counter) so
+        // the checkpoint can write the authoritative one; older snapshots remain
+        // as backup until the new snapshot + MANIFEST are durable.
+        let path = GraphDb::snapshot_path(dir, seq);
+        if path.exists() {
+            std::fs::remove_file(&path)
+                .map_err(|e| anyhow::anyhow!("Failed to remove stale snapshot {}: {e}", path.display()))?;
+        }
+        self.checkpoint(dir, true)?;
+        // The authoritative snapshot + MANIFEST are now durable; the remaining
+        // old snapshots (different sequences) are redundant. Best-effort.
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if name.starts_with("snapshot.") && name.ends_with(".snap") {
+                    let seq_str = name.trim_start_matches("snapshot.").trim_end_matches(".snap");
+                    if let Ok(n) = seq_str.parse::<u64>() {
+                        if n != seq {
+                            let _ = std::fs::remove_file(entry.path());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Extension trait adding GQL methods to `WriteTxn`.
@@ -1033,4 +1188,52 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn test_checkpoint_recover_cycle() {
+        let dir = std::env::temp_dir().join(format!("spire_test_ckpt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("Failed to create temp dir");
+        let graph_id = GraphId::new(1);
+
+        // Run 1: WAL-backed graph, commit, checkpoint (snapshot + MANIFEST).
+        {
+            let db = GraphDb::new_with_wal(dir.join("wal.log")).expect("Failed to create WAL graph");
+            db.create_node(
+                vec!["Ckpt".to_string()],
+                vec![("name".to_string(), Value::String(to_db_string("one")))],
+            )
+            .unwrap();
+            let outcome = db
+                .checkpoint(&dir, true)
+                .expect("checkpoint failed")
+                .expect("expected a snapshot");
+            assert_eq!(outcome.snapshot_seq, 1);
+            assert!(dir.join("snapshot.1.snap").exists(), "snapshot.1 written");
+            assert!(dir.join("MANIFEST").exists(), "MANIFEST written");
+        }
+
+        // Run 2: recover cleanly (no WAL/snapshot epoch hard-fail), add a node,
+        // checkpoint again.
+        {
+            let db = GraphDb::recover(&dir, graph_id).expect("recover should not hard-fail");
+            assert_eq!(db.node_count(), 1, "node from run 1 survives");
+            db.create_node(
+                vec!["Ckpt".to_string()],
+                vec![("name".to_string(), Value::String(to_db_string("two")))],
+            )
+            .unwrap();
+            db.checkpoint(&dir, true).expect("checkpoint failed");
+            assert_eq!(db.node_count(), 2);
+        }
+
+        // Run 3: both nodes survive the crash.
+        {
+            let db = GraphDb::recover(&dir, graph_id).expect("recover should not hard-fail");
+            assert_eq!(db.node_count(), 2, "both nodes survive the crash");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
+

@@ -473,10 +473,11 @@ impl MemoryGraphActor {
                     msg
                 );
 
-                if msg.contains("wal snapshot sequence")
-                    && msg.contains("does not match applied snapshot")
-                {
-                    warn!("MemoryGraph: WAL/snapshot sequence mismatch detected — removing stale WAL, keeping snapshots");
+                let mismatch = msg.contains("wal snapshot sequence")
+                    && msg.contains("does not match applied snapshot");
+
+                if mismatch {
+                    warn!("MemoryGraph: WAL/snapshot sequence mismatch detected — removing stale WAL, re-baselining");
                     let wal_path = data_dir.join("wal.log");
                     if wal_path.exists() {
                         std::fs::remove_file(&wal_path).map_err(|e| {
@@ -496,7 +497,18 @@ impl MemoryGraphActor {
                 info!("MemoryGraph: recovering graph from: {} (stale WAL removed, snapshots preserved)", data_dir.display());
                 let fresh_db = GraphDb::recover(data_dir, graph_id)
                     .map_err(|e| anyhow::anyhow!("Failed to recover fresh graph: {}", e))?;
-                Arc::new(fresh_db)
+                let fresh_db = Arc::new(fresh_db);
+
+                if mismatch {
+                    // Heal the divergent state: unify the snapshot sequence with
+                    // the freshly reset WAL and publish a MANIFEST so recovery
+                    // never hard-fails on the epoch cross-check again.
+                    if let Err(e) = fresh_db.rebaseline_after_recovery(data_dir) {
+                        warn!("MemoryGraph: re-baseline after mismatch failed: {}", e);
+                    }
+                }
+
+                fresh_db
             }
         };
 
@@ -1452,24 +1464,15 @@ impl MemoryGraphActor {
                             }
                         }
 
-                        let next_seq = match GraphDb::latest_snapshot_sequence(&data_dir) {
-                            Ok(Some(seq)) => seq + 1,
-                            Ok(None) => 1,
-                            Err(e) => {
-                                warn!(
-                                    "MemoryGraph snapshot task: failed to get latest sequence: {}",
-                                    e
-                                );
-                                continue;
-                            }
-                        };
-
-                        match graph_db.write_snapshot(&data_dir, next_seq, true) {
-                            Ok(outcome) => {
+                        match graph_db.checkpoint(&data_dir, true) {
+                            Ok(Some(outcome)) => {
                                 info!("MemoryGraph snapshot task: snapshot written (seq={}, sections={})", outcome.snapshot_seq, outcome.section_count);
                             }
+                            Ok(None) => {
+                                info!("MemoryGraph snapshot task: checkpoint skipped (no new commits)");
+                            }
                             Err(e) => {
-                                warn!("MemoryGraph snapshot task: failed to write snapshot: {}", e);
+                                warn!("MemoryGraph snapshot task: checkpoint failed: {}", e);
                             }
                         }
                     }
@@ -3590,32 +3593,16 @@ impl Actor for MemoryGraphActor {
                         .as_ref()
                         .ok_or_else(|| anyhow::anyhow!("GraphDb not initialized"))?;
 
-                    // The debounced background snapshot task can be writing the
-                    // same next sequence concurrently; on "file exists" wait for
-                    // it to finish, then recompute and retry once.
-                    let mut outcome = None;
-                    for attempt in 0..2 {
-                        let next_seq = match GraphDb::latest_snapshot_sequence(data_dir)? {
-                            Some(seq) => seq + 1,
-                            None => 1,
-                        };
-                        match graph_db.write_snapshot(data_dir, next_seq, true) {
-                            Ok(o) => {
-                                outcome = Some(o);
-                                break;
-                            }
-                            Err(e) if attempt == 0 => {
-                                info!("MemoryGraph: snapshot race ({}), retrying", e);
-                                std::thread::sleep(std::time::Duration::from_millis(1500));
-                            }
-                            Err(e) => return Err(e),
-                        }
+                    // The checkpoint is idempotent at the WAL high-water mark, so a
+                    // concurrent debounced snapshot write cannot race into a
+                    // duplicate sequence.
+                    match graph_db.checkpoint(data_dir, true)? {
+                        Some(outcome) => info!(
+                            "MemoryGraph: snapshot written (seq={}, sections={})",
+                            outcome.snapshot_seq, outcome.section_count
+                        ),
+                        None => info!("MemoryGraph: checkpoint skipped (no new commits)"),
                     }
-                    let outcome = outcome.expect("retry loop returned without outcome");
-                    info!(
-                        "MemoryGraph: snapshot written (seq={}, sections={})",
-                        outcome.snapshot_seq, outcome.section_count
-                    );
                     graph_db.compact()?;
                     Ok(())
                 })();
